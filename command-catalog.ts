@@ -12,7 +12,8 @@ const ALLOW = new Set([
   // Shell state, introspection, and inert utilities.
   ":", "true", "false", "set", "shopt", "export", "readonly", "unset", "declare", "typeset", "local",
   "umask", "ulimit", "alias", "unalias", "hash", "help", "history", "jobs", "disown", "wait", "shift",
-  "return", "break", "continue", "printf", "echo", "pwd", "basename", "dirname", "yes", "sleep", "seq",
+  "return", "break", "continue", "exit", "logout", "cd", "pushd", "popd", "dirs", "read", "readarray", "mapfile",
+  "printf", "echo", "pwd", "basename", "dirname", "yes", "sleep", "seq",
   "clear", "tput", "stty", "tty", "logname", "whoami", "id", "groups", "who", "w", "uptime", "date",
   "cal", "nproc", "arch", "uname", "hostname", "hostid", "getconf", "locale", "printenv", "env",
 ]);

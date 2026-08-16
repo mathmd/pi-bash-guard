@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { builtinCommandCategory, SHELL_CLOSING_WORDS, SHELL_PREFIX_WORDS } from "../command-catalog.ts";
 
 test("common shell and Unix commands have conservative categories", () => {
+  assert.equal(builtinCommandCategory("cd"), "allow");
+  assert.equal(builtinCommandCategory("exit"), "allow");
   assert.equal(builtinCommandCategory("set"), "allow");
   assert.equal(builtinCommandCategory("tee"), "edit");
   assert.equal(builtinCommandCategory("cat"), "read");

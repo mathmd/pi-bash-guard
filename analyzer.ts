@@ -11,8 +11,85 @@ type OpToken = { op: string };
 const CONTROL_OPS = new Set(["|", "|&", "&&", "||", ";", "&", "(", ")"]);
 const REDIRECT_OPS = new Set([">", ">>", "1>", "1>>", "2>", "2>>", "&>", "<"]);
 const INTERPRETERS = new Set(["bash", "sh", "zsh", "fish", "python", "python3", "node", "ruby", "perl", "deno", "bun"]);
-const GIT_READ_SUBCOMMANDS = new Set(["status", "diff", "log", "show", "branch", "tag", "remote", "rev-parse", "ls-files", "grep", "blame", "describe", "shortlog"]);
+const GIT_READ_SUBCOMMANDS = new Set([
+  "status", "diff", "diff-files", "diff-index", "diff-tree", "log", "show", "rev-parse", "ls-files", "grep",
+  "blame", "describe", "shortlog", "for-each-ref", "show-ref", "ls-tree", "cat-file", "name-rev", "rev-list",
+  "merge-base", "count-objects", "whatchanged", "range-diff", "cherry", "verify-commit", "verify-tag", "version",
+  "help", "check-ignore", "check-attr", "check-mailmap", "check-ref-format", "get-tar-commit-id", "patch-id", "var", "ls-remote",
+]);
+const GIT_GLOBAL_VALUE_OPTIONS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix"]);
+const GIT_INFORMATION_OPTIONS = new Set(["--version", "-v", "--help", "-h", "--exec-path", "--html-path", "--man-path", "--info-path"]);
 
+type GitInvocation = { subcommand: string; args: string[]; informational: boolean };
+
+function parseGitInvocation(args: string[]): GitInvocation {
+  let index = 0;
+  let informational = false;
+  while (index < args.length) {
+    const arg = args[index]!;
+    if (arg === "--") { index++; break; }
+    if (!arg.startsWith("-")) break;
+    if (GIT_INFORMATION_OPTIONS.has(arg) || [...GIT_INFORMATION_OPTIONS].some((option) => arg.startsWith(`${option}=`))) informational = true;
+    if (GIT_GLOBAL_VALUE_OPTIONS.has(arg)) index += 2;
+    else index++;
+  }
+  return { subcommand: args[index] ?? "", args: args.slice(index + 1), informational };
+}
+
+function onlyOptions(args: string[], valueOptions: Set<string>): boolean {
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!;
+    if (arg === "--") return index === args.length - 1;
+    if (!arg.startsWith("-")) return false;
+    if (valueOptions.has(arg)) index++;
+  }
+  return true;
+}
+
+function positionalAfterOptions(args: string[], valueOptions: Set<string>): string[] {
+  const positional: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!;
+    if (arg === "--") {
+      positional.push(...args.slice(index + 1));
+      break;
+    }
+    if (valueOptions.has(arg)) index++;
+    else if (!arg.startsWith("-")) positional.push(arg);
+  }
+  return positional;
+}
+
+function isReadOnlyGitOperation(invocation: GitInvocation): boolean {
+  const { subcommand: sub, args } = invocation;
+  if (invocation.informational) return true;
+  if (!sub) return false;
+  if (GIT_READ_SUBCOMMANDS.has(sub)) {
+    if (args.some((arg) => arg === "--output" || arg.startsWith("--output=") || arg.startsWith("--open-files-in-pager"))) return false;
+    return true;
+  }
+  if (sub === "branch") {
+    if (args.some((arg) => ["-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move", "--copy", "--edit-description", "--set-upstream-to", "--unset-upstream"].includes(arg))) return false;
+    return onlyOptions(args, new Set(["--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--format", "--sort", "--column"]));
+  }
+  if (sub === "tag") {
+    if (args.some((arg) => ["-d", "--delete", "-f", "--force", "-a", "--annotate", "-s", "--sign"].includes(arg))) return false;
+    return onlyOptions(args, new Set(["--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--format", "--sort", "--column"]));
+  }
+  if (sub === "remote") return args.length === 0 || args.every((arg) => arg === "-v" || arg === "--verbose") || ["show", "get-url"].includes(args[0] ?? "");
+  if (sub === "stash") return ["list", "show"].includes(args[0] ?? "");
+  if (sub === "worktree") return args[0] === "list";
+  if (sub === "submodule") return ["status", "summary"].includes(args[0] ?? "status");
+  if (sub === "notes") return ["list", "show"].includes(args[0] ?? "list");
+  if (sub === "reflog") return ["show", "exists"].includes(args[0] ?? "show");
+  if (sub === "config") {
+    if (args.some((arg) => ["--add", "--replace-all", "--unset", "--unset-all", "--remove-section", "--rename-section", "--edit", "-e", "set", "unset", "rename-section", "remove-section"].includes(arg))) return false;
+    const positional = positionalAfterOptions(args, new Set(["-f", "--file", "--blob", "--type", "--default"]));
+    return positional.length <= 1 || ["get", "get-all", "get-regexp", "get-urlmatch", "list"].includes(positional[0] ?? "");
+  }
+  if (sub === "fsck") return !args.includes("--lost-found") && !args.includes("--write-commit-graph");
+  return false;
+}
 const CATASTROPHIC: Array<[RegExp, string]> = [
   [/\b(?:mkfs(?:\.\w+)?|newfs_\w+|wipefs)\b/, "filesystem formatting or signature destruction"],
   [/\bdd\b[^\n]*\bof=\/dev\//, "raw device write"],
@@ -125,15 +202,28 @@ export class GuardAnalyzer {
       const args = strings.slice(index + 1).filter((arg) => !REDIRECT_OPS.has(arg));
 
       if (cmd === "git") {
-        const subIndex = args.findIndex((arg) => !arg.startsWith("-"));
-        const sub = subIndex >= 0 ? args[subIndex] : "";
-        const mutativeReadNamed =
-          (sub === "branch" && args.some((arg) => /^-[dDmMcC]$/.test(arg))) ||
-          (sub === "tag" && args.some((arg) => arg === "-d" || arg === "--delete")) ||
-          (sub === "remote" && args.some((arg) => ["add", "remove", "rename", "set-url", "prune"].includes(arg)));
-        if (!GIT_READ_SUBCOMMANDS.has(sub) || mutativeReadNamed) {
+        const invocation = parseGitInvocation(args);
+        const destructive =
+          (invocation.subcommand === "push" && invocation.args.some((arg) => arg === "-f" || arg.startsWith("--force"))) ||
+          (invocation.subcommand === "reset" && invocation.args.includes("--hard")) ||
+          (invocation.subcommand === "clean" && invocation.args.some((arg) => /^-[A-Za-z]*f/.test(arg)));
+        if (destructive) return this.result("deny", [`Destructive Git operation (${invocation.subcommand}) is prohibited`]);
+        const readOnly = isReadOnlyGitOperation(invocation);
+        if (!readOnly) {
           baseDecision = strongest(baseDecision, "ask");
-          reasons.push(`Mutative or unknown Git operation (${sub || "git"}) requires approval`);
+          reasons.push(`Mutative or unknown Git operation (${invocation.subcommand || "git"}) requires approval`);
+        } else {
+          let afterSeparator = false;
+          for (const arg of invocation.args) {
+            if (arg === "--") { afterSeparator = true; continue; }
+            if (arg.startsWith("-")) continue;
+            const colon = ["show", "cat-file", "diff", "log"].includes(invocation.subcommand) ? arg.indexOf(":") : -1;
+            const rawPath = colon >= 0 ? arg.slice(colon + 1) : arg;
+            const candidate = this.path(rawPath, cwd);
+            if ((colon >= 0 || afterSeparator || rawPath.startsWith(".") || looksLikePath(rawPath) || pathExists(candidate)) && this.policy.isSecret(candidate)) {
+              accesses.push({ path: candidate, kind: "read", source: "git", literal: true, existed: pathExists(candidate) });
+            }
+          }
         }
         continue;
       }

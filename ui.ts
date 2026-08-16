@@ -110,6 +110,11 @@ async function grantOwnership(
   return ownershipSatisfies(policy.ownership(candidate.path), candidate.required);
 }
 
+async function refuseWithOptionalComment(ctx: ExtensionContext): Promise<PromptDecision> {
+  const context = await ctx.ui.input("Comment on refusal (optional)", "Leave empty to refuse without a comment");
+  return { action: "refuse", ...(context?.trim() ? { context: context.trim() } : {}) };
+}
+
 async function promptFlow(
   ctx: ExtensionContext,
   policy: PolicyStore,
@@ -120,12 +125,12 @@ async function promptFlow(
   if (analysis.decision === "deny") {
     const choices = analysis.trashablePaths.length ? ["Refuse", "Move to trash instead"] : ["Refuse"];
     const choice = await menu(ctx, summary(analysis, subject), choices, false);
-    return { action: choice === "Move to trash instead" ? "trash" : "refuse" };
+    return choice === "Move to trash instead" ? { action: "trash" } : refuseWithOptionalComment(ctx);
   }
 
   const candidate = analysis.ownershipCandidates.find((item) => !policy.isPolicyPath(item.path));
   while (true) {
-    const choices = ["Allow once", "Refuse (optional context)"];
+    const choices = ["Allow once", "Refuse"];
     if (candidate) choices.push(`Grant ${candidate.required} ownership…`);
     const choice = await menu(ctx, summary(analysis, subject), choices, false);
     if (choice === "Allow once") return { action: "allow" };
@@ -133,10 +138,7 @@ async function promptFlow(
       if (await grantOwnership(ctx, policy, candidate)) return { action: "allow" };
       continue;
     }
-    if (choice === "Refuse (optional context)") {
-      const context = await ctx.ui.input("Refusal context (optional)", "Leave empty for no context");
-      return { action: "refuse", ...(context?.trim() ? { context: context.trim() } : {}) };
-    }
+    if (choice === "Refuse") return refuseWithOptionalComment(ctx);
   }
 }
 

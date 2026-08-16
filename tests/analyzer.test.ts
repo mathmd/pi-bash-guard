@@ -87,9 +87,42 @@ test("all pipeline segments are analyzed", () => {
 test("Git read operations allow, mutations ask, and forced push denies", () => {
   const f = fixture();
   try {
-    assert.equal(f.analyzer.analyzeCommand("git status", f.workspace).decision, "allow");
-    assert.equal(f.analyzer.analyzeCommand("git commit -m test", f.workspace).decision, "ask");
+    writeFileSync(join(f.workspace, ".env"), "TOKEN=test\n");
+    const readOnly = [
+      "git status --short --ignored",
+      `git -C ${f.workspace} status`,
+      `git -C ${f.workspace} log -1 --oneline`,
+      `git -C ${f.workspace} diff --check`,
+      "git branch --contains main",
+      "git tag --list",
+      "git remote show origin",
+      "git config user.name",
+      `git config --file ${join(f.workspace, "config")} --get user.name`,
+      "git stash list",
+      "git worktree list",
+      "git reflog show",
+      "git fsck",
+    ];
+    for (const command of readOnly) assert.equal(f.analyzer.analyzeCommand(command, f.workspace).decision, "allow", command);
+
+    const mutative = [
+      "git commit -m test",
+      "git branch feature",
+      "git tag v1",
+      "git remote add origin example.invalid/repo",
+      "git config user.name Changed",
+      "git stash",
+      "git worktree add ../copy",
+      "git cherry-pick HEAD",
+      `git diff --output=${join(f.workspace, "changes.patch")}`,
+    ];
+    for (const command of mutative) assert.equal(f.analyzer.analyzeCommand(command, f.workspace).decision, "ask", command);
+
+    assert.equal(f.analyzer.analyzeCommand("git show HEAD:.env", f.workspace).decision, "deny");
+    assert.equal(f.analyzer.analyzeCommand("git log -- .env", f.workspace).decision, "deny");
     assert.equal(f.analyzer.analyzeCommand("git push --force origin main", f.workspace).decision, "deny");
+    assert.equal(f.analyzer.analyzeCommand(`git -C ${f.workspace} push --force-with-lease origin main`, f.workspace).decision, "deny");
+    assert.equal(f.analyzer.analyzeCommand(`git -C ${f.workspace} reset --hard HEAD`, f.workspace).decision, "deny");
   } finally { f.cleanup(); }
 });
 
@@ -150,6 +183,8 @@ test("creating a new policy or .git file is not silently allowed", () => {
 test("common shell grammar and builtins are recognized", () => {
   const f = fixture();
   try {
+    assert.equal(f.analyzer.analyzeCommand(`cd ${f.workspace}`, f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand("exit 0", f.workspace).decision, "allow");
     assert.equal(f.analyzer.analyzeCommand("set -e", f.workspace).decision, "allow");
     assert.equal(f.analyzer.analyzeCommand("{ echo safe; }", f.workspace).decision, "allow");
     assert.equal(f.analyzer.analyzeCommand("if true; then echo safe; fi", f.workspace).decision, "allow");
