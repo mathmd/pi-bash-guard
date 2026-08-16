@@ -24,37 +24,54 @@ async function menu(
     return selected;
   }
 
-  const { Container, Key, matchesKey, SelectList, Text } = await import("@earendil-works/pi-tui");
+  const { Key, matchesKey } = await import("@earendil-works/pi-tui");
   const result = await ctx.ui.custom<{ action: "select"; value: string } | { action: "back" } | { action: "cancel" }>(
     (tui, theme, _keybindings, done) => {
-      const container = new Container();
-      container.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
-      const list = new SelectList(labels.map((label) => ({ value: label, label })), Math.min(labels.length, 8), {
-        selectedPrefix: (text) => theme.fg("accent", text),
-        selectedText: (text) => theme.fg("accent", text),
-        description: (text) => theme.fg("muted", text),
-        scrollInfo: (text) => theme.fg("dim", text),
-        noMatch: (text) => theme.fg("warning", text),
-      });
-      list.onSelect = (item) => done({ action: "select", value: item.value });
-      container.addChild(list);
-      container.addChild(new Text(theme.fg("dim", `↑↓/jk navigate • l/Enter accept${allowBack ? " • h back" : ""} • Esc/C-c cancel`), 1, 0));
+      let selected = 0;
+
+      function titleLines(width: number): string[] {
+        const available = Math.max(20, width - 2);
+        const fitted: string[] = [];
+        for (const source of title.split("\n")) {
+          if (!source) {
+            fitted.push("");
+            continue;
+          }
+          for (let start = 0; start < source.length; start += available) fitted.push(source.slice(start, start + available));
+        }
+        if (fitted.length <= 12) return fitted;
+        return [...fitted.slice(0, 11), theme.fg("muted", "…")];
+      }
+
       return {
-        render: (width) => container.render(width),
-        invalidate: () => container.invalidate(),
+        render: (width) => {
+          const heading = titleLines(width);
+          if (heading[0]) heading[0] = theme.fg("accent", theme.bold(heading[0]));
+          const rows = labels.map((label, index) => {
+            const marker = index === selected ? "▶" : " ";
+            const row = `${marker} ${label}`;
+            return index === selected ? theme.fg("accent", row) : row;
+          });
+          return [
+            ...heading,
+            "",
+            ...rows,
+            "",
+            theme.fg("muted", `↑↓/jk move · l/enter confirm${allowBack ? " · h back" : ""} · esc/ctrl-c cancel`),
+          ];
+        },
+        invalidate: () => {},
         handleInput: (data) => {
           if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) done({ action: "cancel" });
-          else if (allowBack && data === "h") done({ action: "back" });
-          else if (data === "l") {
-            const item = list.getSelectedItem();
-            if (item) done({ action: "select", value: item.value });
-          } else if (data === "j") list.handleInput("\u001b[B");
-          else if (data === "k") list.handleInput("\u001b[A");
-          else list.handleInput(data);
+          else if (allowBack && matchesKey(data, "h")) done({ action: "back" });
+          else if (matchesKey(data, "l") || matchesKey(data, "enter")) done({ action: "select", value: labels[selected]! });
+          else if (matchesKey(data, "j") || matchesKey(data, "down")) selected = Math.min(labels.length - 1, selected + 1);
+          else if (matchesKey(data, "k") || matchesKey(data, "up")) selected = Math.max(0, selected - 1);
           tui.requestRender();
         },
       };
     },
+    { overlay: false },
   );
   if (!result || result.action === "cancel") throw new MenuCancelled();
   return result.action === "back" ? undefined : result.value;
