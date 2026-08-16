@@ -8,7 +8,30 @@ class MenuCancelled extends Error {}
 
 function summary(analysis: Analysis, subject: string): string {
   const reasons = analysis.reasons.map((reason) => `• ${reason}`).join("\n");
-  return `${subject}\n\n${reasons}`.slice(0, 8_000);
+  return `${subject}\n\n${reasons}`;
+}
+
+export interface DetailViewport {
+  lines: string[];
+  offset: number;
+  pageSize: number;
+  total: number;
+}
+
+export function detailViewport(text: string, width: number, terminalRows: number, optionCount: number, requestedOffset = 0): DetailViewport {
+  const availableWidth = Math.max(20, width - 2);
+  const wrapped: string[] = [];
+  for (const source of text.split("\n")) {
+    if (!source) {
+      wrapped.push("");
+      continue;
+    }
+    for (let start = 0; start < source.length; start += availableWidth) wrapped.push(source.slice(start, start + availableWidth));
+  }
+  const availableRows = Math.max(3, terminalRows - optionCount - 6);
+  const pageSize = Math.max(1, availableRows - (wrapped.length > availableRows ? 1 : 0));
+  const offset = Math.min(Math.max(0, requestedOffset), Math.max(0, wrapped.length - pageSize));
+  return { lines: wrapped.slice(offset, offset + pageSize), offset, pageSize, total: wrapped.length };
 }
 
 /** Bottom-panel selector with modal navigation. */
@@ -28,32 +51,29 @@ async function menu(
   const result = await ctx.ui.custom<{ action: "select"; value: string } | { action: "back" } | { action: "cancel" }>(
     (tui, theme, _keybindings, done) => {
       let selected = 0;
+      let detailOffset = 0;
+      let detailCount = 0;
+      let detailPage = 1;
 
-      function titleLines(width: number): string[] {
-        const available = Math.max(20, width - 2);
-        const fitted: string[] = [];
-        for (const source of title.split("\n")) {
-          if (!source) {
-            fitted.push("");
-            continue;
-          }
-          for (let start = 0; start < source.length; start += available) fitted.push(source.slice(start, start + available));
-        }
-        if (fitted.length <= 12) return fitted;
-        return [...fitted.slice(0, 11), theme.fg("muted", "…")];
-      }
 
       return {
         render: (width) => {
-          const heading = titleLines(width);
-          if (heading[0]) heading[0] = theme.fg("accent", theme.bold(heading[0]));
+          const viewport = detailViewport(title, width, tui.terminal.rows, labels.length, detailOffset);
+          detailOffset = viewport.offset;
+          detailCount = viewport.total;
+          detailPage = viewport.pageSize;
+          const visibleDetails = [...viewport.lines];
+          if (detailOffset === 0 && visibleDetails[0]) visibleDetails[0] = theme.fg("accent", theme.bold(visibleDetails[0]));
+          if (viewport.total > viewport.pageSize) {
+            visibleDetails.push(theme.fg("muted", `details ${detailOffset + 1}–${Math.min(detailCount, detailOffset + detailPage)} of ${detailCount} · ctrl-u/ctrl-d scroll · g/G first/last`));
+          }
           const rows = labels.map((label, index) => {
             const marker = index === selected ? "▶" : " ";
             const row = `${marker} ${label}`;
             return index === selected ? theme.fg("accent", row) : row;
           });
           return [
-            ...heading,
+            ...visibleDetails,
             "",
             ...rows,
             "",
@@ -67,6 +87,10 @@ async function menu(
           else if (matchesKey(data, "l") || matchesKey(data, "enter")) done({ action: "select", value: labels[selected]! });
           else if (matchesKey(data, "j") || matchesKey(data, "down")) selected = Math.min(labels.length - 1, selected + 1);
           else if (matchesKey(data, "k") || matchesKey(data, "up")) selected = Math.max(0, selected - 1);
+          else if (matchesKey(data, Key.ctrl("d"))) detailOffset = Math.min(Math.max(0, detailCount - detailPage), detailOffset + detailPage);
+          else if (matchesKey(data, Key.ctrl("u"))) detailOffset = Math.max(0, detailOffset - detailPage);
+          else if (matchesKey(data, "g")) detailOffset = 0;
+          else if (data === "G") detailOffset = Math.max(0, detailCount - detailPage);
           tui.requestRender();
         },
       };

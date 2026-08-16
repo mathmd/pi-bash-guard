@@ -107,19 +107,47 @@ export default function bashGuard(pi: ExtensionAPI): void {
     }
     if (analysis.decision === "allow") return;
 
-    const response = await promptForDecision(ctx, policy!, analysis, subjectFor(event));
-    if (response.action === "allow") return;
-    if (response.action === "trash" && isToolCallEventType("bash", event) && analysis.trashablePaths.length) {
-      // Replace, rather than execute inside the hook, so Pi records the actual reversible operation.
-      event.input.command = shellQuote(["gio", "trash", "--", ...analysis.trashablePaths]);
-      pending.delete(event.toolCallId);
-      return;
+    let promptItems: Array<{ subject: string; analysis: Analysis; command?: string }>;
+    if (isToolCallEventType("bash", event)) {
+      const units = analyzer!.analyzeCommandUnits(event.input.command, ctx.cwd)
+        .filter((unit) => unit.analysis.decision !== "allow");
+      const combined = units.reduce((decision, unit) => strongest(decision, unit.analysis.decision), "allow" as Analysis["decision"]);
+      promptItems = strongest(combined, analysis.decision) === combined
+        ? units.map((unit, index) => ({
+            subject: `Command requiring permission (${index + 1}/${units.length}, shell order):\n${unit.command}`,
+            analysis: unit.analysis,
+            command: unit.command,
+          }))
+        : [{ subject: subjectFor(event), analysis, command: event.input.command }];
+    } else {
+      promptItems = [{ subject: subjectFor(event), analysis }];
     }
-    pending.delete(event.toolCallId);
-    return {
-      block: true,
-      reason: `Blocked by bash-guard.${response.context ? ` User context: ${response.context}` : ""} ${analysis.reasons.join(" ")}`,
-    };
+
+    for (const item of promptItems) {
+      const itemAnalysis = item.command ? analyzer!.analyzeCommand(item.command, ctx.cwd) : item.analysis;
+      if (itemAnalysis.decision === "allow") continue;
+      const promptAnalysis = promptItems.length > 1 && itemAnalysis.trashablePaths.length
+        ? {
+            ...itemAnalysis,
+            trashablePaths: [],
+            reasons: [...itemAnalysis.reasons, "Run this deletion separately to use reversible trash substitution"],
+          }
+        : itemAnalysis;
+      const response = await promptForDecision(ctx, policy!, promptAnalysis, item.subject);
+      if (response.action === "allow") continue;
+      if (response.action === "trash" && isToolCallEventType("bash", event) && itemAnalysis.trashablePaths.length && promptItems.length === 1) {
+        // Replace, rather than execute inside the hook, so Pi records the actual reversible operation.
+        event.input.command = shellQuote(["gio", "trash", "--", ...itemAnalysis.trashablePaths]);
+        pending.delete(event.toolCallId);
+        return;
+      }
+      pending.delete(event.toolCallId);
+      return {
+        block: true,
+        reason: `Blocked by bash-guard.${response.context ? ` User context: ${response.context}` : ""} ${itemAnalysis.reasons.join(" ")}`,
+      };
+    }
+    return;
   });
 
   pi.on("tool_result", async (event: ToolResultEvent) => {

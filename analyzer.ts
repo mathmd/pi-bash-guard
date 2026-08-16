@@ -8,6 +8,7 @@ import type { PolicyStore } from "./policy.ts";
 import { builtinCommandCategory, SHELL_CLOSING_WORDS, SHELL_HEADER_WORDS, SHELL_PREFIX_WORDS } from "./command-catalog.ts";
 
 type OpToken = { op: string };
+type GlobToken = { op: "glob"; pattern: string };
 const CONTROL_OPS = new Set(["|", "|&", "&&", "||", ";", "&", "(", ")"]);
 const REDIRECT_OPS = new Set([">", ">>", "1>", "1>>", "2>", "2>>", "&>", "<"]);
 const INTERPRETERS = new Set(["bash", "sh", "zsh", "fish", "python", "python3", "node", "ruby", "perl", "deno", "bun"]);
@@ -107,6 +108,10 @@ function isOp(token: ParseToken): token is OpToken {
   return typeof token === "object" && token !== null && "op" in token;
 }
 
+function isGlob(token: ParseToken): token is GlobToken {
+  return typeof token === "object" && token !== null && "op" in token && token.op === "glob" && "pattern" in token;
+}
+
 function commandName(value: string): string {
   return basename(value);
 }
@@ -127,6 +132,54 @@ function splitSegments(tokens: ParseToken[]): ParseToken[][] {
   if (current.length) segments.push(current);
   return segments;
 }
+export interface CommandAnalysisUnit {
+  command: string;
+  analysis: Analysis;
+}
+
+/** Split top-level shell commands in lexical execution order without changing their source text. */
+export function splitShellCommandUnits(command: string): string[] {
+  const units: string[] = [];
+  let start = 0;
+  let quote: "'" | '"' | "`" | undefined;
+  let escaped = false;
+  let parentheses = 0;
+  let comment = false;
+
+  const push = (end: number) => {
+    const value = command.slice(start, end).trim();
+    if (value) units.push(value);
+  };
+
+  for (let index = 0; index < command.length; index++) {
+    const char = command[index]!;
+    if (comment) {
+      if (char !== "\n") continue;
+      comment = false;
+    }
+    if (escaped) { escaped = false; continue; }
+    if (char === "\\" && quote !== "'") { escaped = true; continue; }
+    if (quote) {
+      if (char === quote) quote = undefined;
+      continue;
+    }
+    if (char === "'" || char === '"' || char === "`") { quote = char; continue; }
+    if (char === "#" && (index === 0 || /[\s;|&()]/.test(command[index - 1]!))) { comment = true; continue; }
+    if (char === "(") { parentheses++; continue; }
+    if (char === ")") { parentheses = Math.max(0, parentheses - 1); continue; }
+    if (parentheses > 0) continue;
+
+    const two = command.slice(index, index + 2);
+    const operatorLength = ["&&", "||", "|&", ";;"].includes(two) ? 2 : [";", "|", "&", "\n"].includes(char) ? 1 : 0;
+    if (!operatorLength) continue;
+    push(index);
+    index += operatorLength - 1;
+    start = index + 1;
+  }
+  push(command.length);
+  return units.length ? units : [command.trim()].filter(Boolean);
+}
+
 export class GuardAnalyzer {
   private readonly policy: PolicyStore;
 
@@ -136,6 +189,10 @@ export class GuardAnalyzer {
 
   private path(raw: string, cwd: string): string {
     return canonicalPath(resolvePath(raw, cwd, this.policy.home));
+  }
+
+  analyzeCommandUnits(command: string, cwd: string): CommandAnalysisUnit[] {
+    return splitShellCommandUnits(command).map((unit) => ({ command: unit, analysis: this.analyzeCommand(unit, cwd) }));
   }
 
   analyzePathAccess(path: string, kind: AccessKind, cwd: string, source: string, literal = true): Analysis {
@@ -161,6 +218,10 @@ export class GuardAnalyzer {
       const commandWords: string[] = [];
       for (let i = 0; i < segment.length; i++) {
         const token = segment[i];
+        if (isGlob(token)) {
+          commandWords.push(token.pattern);
+          continue;
+        }
         if (isOp(token) && REDIRECT_OPS.has(token.op)) {
           const target = segment[i + 1];
           if (typeof target === "string") {
@@ -230,7 +291,7 @@ export class GuardAnalyzer {
 
       if (cmd === "rm" || cmd === "rmdir" || cmd === "unlink") {
         for (const arg of args.filter((value) => !value.startsWith("-"))) {
-          if (!looksLikePath(arg) && !pathExists(this.path(arg, cwd))) continue;
+          if (!looksLikePath(arg) && !/[*?\[]/.test(arg) && !pathExists(this.path(arg, cwd))) continue;
           const path = this.path(arg, cwd);
           accesses.push({ path, kind: "delete", source: cmd, literal: !/[*?$`]/.test(arg), existed: pathExists(path) });
           if (!/[*?$`]/.test(arg)) trashable.push(path);
@@ -316,9 +377,24 @@ export class GuardAnalyzer {
 
       if (executableRaw.includes("/")) {
         const executable = this.path(executableRaw, cwd);
-        accesses.push({ path: executable, kind: "execute", source: "direct script", literal: true, existed: pathExists(executable) });
         const screening = this.screenScript(executable, cwd);
-        if (screening) return this.result("deny", [`Prohibited script content: ${screening}`], accesses);
+        if (screening) return this.result("deny", [`Prohibited script content: ${screening}`]);
+        if (this.policy.isSystemReadonlyPath(executable)) {
+          const systemCategory = this.policy.commandCategory(cmd) ?? builtinCommandCategory(cmd);
+          if (!systemCategory) {
+            baseDecision = strongest(baseDecision, "ask");
+            reasons.push(`Unknown system command ${cmd} requires approval`);
+          } else {
+            const categorized = this.analyzeCategorizedCommand(systemCategory, cmd, args, cwd);
+            baseDecision = strongest(baseDecision, categorized.decision);
+            reasons.push(...categorized.reasons);
+            accesses.push(...categorized.accesses);
+            creations.push(...categorized.creationCandidates);
+            trashable.push(...categorized.trashablePaths);
+          }
+          continue;
+        }
+        accesses.push({ path: executable, kind: "execute", source: "direct script", literal: true, existed: pathExists(executable) });
         continue;
       }
 
@@ -335,7 +411,7 @@ export class GuardAnalyzer {
 
       baseDecision = strongest(baseDecision, "ask");
       reasons.push(`Unknown command ${cmd} requires approval`);
-      for (const arg of args.filter((value) => looksLikePath(value) || pathExists(this.path(value, cwd)))) {
+      for (const arg of args.filter((value) => looksLikePath(value) || /[*?\[]/.test(value) || pathExists(this.path(value, cwd)))) {
         accesses.push({ path: this.path(arg, cwd), kind: "unknown", source: cmd, literal: true });
       }
     }
@@ -364,7 +440,7 @@ export class GuardAnalyzer {
     }
 
     const positional = args.filter((arg) => !arg.startsWith("-"));
-    const pathArguments = positional.filter((arg) => looksLikePath(arg) || pathExists(this.path(arg, cwd)));
+    const pathArguments = positional.filter((arg) => looksLikePath(arg) || /[*?\[]/.test(arg) || pathExists(this.path(arg, cwd)));
     if (category === "read") {
       return this.finalize(pathArguments.map((arg) => ({ path: this.path(arg, cwd), kind: "read", source: command, literal: true })), [], [], []);
     }
@@ -421,7 +497,7 @@ export class GuardAnalyzer {
   private finalize(accesses: PathAccess[], creations: string[], trashable: string[], reasons: string[]): Analysis {
     const safeCreations: string[] = [];
     for (const path of creations) {
-      if (this.policy.isPolicyPath(path) || containsGitMetadata(path)) {
+      if (this.policy.isPolicyPath(path) || this.policy.isSystemReadonlyPath(path) || containsGitMetadata(path)) {
         accesses.push({ path, kind: "edit", source: "creation", literal: true, existed: false });
       } else safeCreations.push(path);
     }
@@ -437,6 +513,12 @@ export class GuardAnalyzer {
       if (this.policy.isSecret(access.path) && ["read", "execute", "unknown"].includes(access.kind)) {
         decision = "deny";
         reasons.push(`Secret access is prohibited: ${access.path}`);
+        continue;
+      }
+      if (this.policy.isSystemReadonlyPath(access.path)) {
+        if (["read", "execute"].includes(access.kind)) continue;
+        decision = "deny";
+        reasons.push(`System read-only path cannot be modified: ${access.path}`);
         continue;
       }
       if (containsGitMetadata(access.path) && ["edit", "delete", "unknown"].includes(access.kind) && access.source !== "git") {

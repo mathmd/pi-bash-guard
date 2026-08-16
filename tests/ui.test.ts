@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { editorInvocation } from "../external-editor.ts";
+import { detailViewport } from "../ui.ts";
 
 test("Neovim opens the policy at the newly appended entry", () => {
   const root = mkdtempSync(join(tmpdir(), "bash-guard-editor-"));
@@ -20,4 +21,15 @@ test("Neovim opens the policy at the newly appended entry", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("long permission details remain scrollable while reserving option rows", () => {
+  const text = Array.from({ length: 30 }, (_, index) => `reason ${index + 1}`).join("\n");
+  const first = detailViewport(text, 80, 12, 3, 0);
+  const last = detailViewport(text, 80, 12, 3, Number.MAX_SAFE_INTEGER);
+  assert.equal(first.total, 30);
+  assert.ok(first.pageSize < first.total);
+  assert.deepEqual(first.lines, ["reason 1", "reason 2"]);
+  assert.deepEqual(last.lines, ["reason 29", "reason 30"]);
+  assert.equal(last.offset + last.lines.length, last.total);
 });

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { GuardAnalyzer } from "../analyzer.ts";
+import { GuardAnalyzer, splitShellCommandUnits } from "../analyzer.ts";
 import { PolicyStore } from "../policy.ts";
 
 function fixture() {
@@ -11,9 +11,10 @@ function fixture() {
   const extension = join(root, "extension");
   const workspace = join(root, "workspace");
   const home = join(root, "home");
-  mkdirSync(extension); mkdirSync(workspace); mkdirSync(home);
-  const policy = new PolicyStore(extension, workspace, home);
-  return { root, workspace, policy, analyzer: new GuardAnalyzer(policy), cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  const systemReadonly = join(root, "nix", "store");
+  mkdirSync(extension); mkdirSync(workspace); mkdirSync(home); mkdirSync(systemReadonly, { recursive: true });
+  const policy = new PolicyStore(extension, workspace, home, [systemReadonly]);
+  return { root, workspace, systemReadonly, policy, analyzer: new GuardAnalyzer(policy), cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 test("read-only command is allowed but secret read is denied", () => {
@@ -24,6 +25,48 @@ test("read-only command is allowed but secret read is denied", () => {
     writeFileSync(plain, "plain"); writeFileSync(secret, "SECRET=test");
     assert.equal(f.analyzer.analyzeCommand(`cat ${plain}`, f.workspace).decision, "allow");
     assert.equal(f.analyzer.analyzeCommand(`cat ${secret}`, f.workspace).decision, "deny");
+  } finally { f.cleanup(); }
+});
+
+test("system read-only roots allow reads and execution but deny mutation", () => {
+  const f = fixture();
+  try {
+    const executable = join(f.systemReadonly, "printf");
+    const unknownExecutable = join(f.systemReadonly, "unknown-tool");
+    const absoluteCat = join(f.systemReadonly, "cat");
+    const data = join(f.systemReadonly, "data.txt");
+    const secret = join(f.systemReadonly, ".env");
+    writeFileSync(executable, "#!/bin/sh\necho safe\n");
+    writeFileSync(unknownExecutable, "#!/bin/sh\necho safe\n");
+    writeFileSync(absoluteCat, "#!/bin/sh\necho safe\n");
+    writeFileSync(data, "safe\n");
+    writeFileSync(secret, "TOKEN=test\n");
+    assert.equal(f.analyzer.analyzeCommand(executable, f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand(unknownExecutable, f.workspace).decision, "ask");
+    assert.equal(f.analyzer.analyzeCommand(`${absoluteCat} ${secret}`, f.workspace).decision, "deny");
+    assert.equal(f.analyzer.analyzeCommand(`cat ${data}`, f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand(`cat ${secret}`, f.workspace).decision, "deny");
+    assert.equal(f.analyzer.analyzeCommand(`echo changed > ${data}`, f.workspace).decision, "deny");
+    assert.equal(f.analyzer.analyzeCommand(`echo new > ${join(f.systemReadonly, "new.txt")}`, f.workspace).decision, "deny");
+    assert.equal(f.analyzer.analyzeCommand(`rm ${data}`, f.workspace).decision, "deny");
+  } finally { f.cleanup(); }
+});
+
+test("compound shell commands are separated in lexical permission order", () => {
+  const f = fixture();
+  try {
+    const command = `echo "literal;value"; unknown-first && cat ${join(f.workspace, "missing.txt")} | unknown-second`;
+    assert.deepEqual(splitShellCommandUnits(command), [
+      'echo "literal;value"',
+      "unknown-first",
+      `cat ${join(f.workspace, "missing.txt")}`,
+      "unknown-second",
+    ]);
+    const requiringPermission = f.analyzer.analyzeCommandUnits(command, f.workspace)
+      .filter((unit) => unit.analysis.decision !== "allow");
+    assert.deepEqual(requiringPermission.map((unit) => unit.command), ["unknown-first", "unknown-second"]);
+    assert.match(requiringPermission[0]!.analysis.reasons.join(" "), /Unknown command unknown-first/);
+    assert.match(requiringPermission[1]!.analysis.reasons.join(" "), /Unknown command unknown-second/);
   } finally { f.cleanup(); }
 });
 
@@ -70,6 +113,9 @@ test("unowned deletion is denied and exposes literal trash targets", () => {
     const result = f.analyzer.analyzeCommand(`rm ${file}`, f.workspace);
     assert.equal(result.decision, "deny");
     assert.deepEqual(result.trashablePaths, [file]);
+    const wildcard = f.analyzer.analyzeCommand("rm *.txt", f.workspace);
+    assert.equal(wildcard.decision, "deny");
+    assert.deepEqual(wildcard.trashablePaths, []);
   } finally { f.cleanup(); }
 });
 

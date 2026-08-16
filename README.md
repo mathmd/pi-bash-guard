@@ -11,6 +11,7 @@ A local Pi extension that combines shell hazard detection with explicit path own
 - Secret reads, catastrophic commands, direct `.git` writes, and irreversible unowned deletion are denied.
 - Remote mutations and mutative Git commands always ask.
 - Headless sessions block anything that would ask.
+- Reads and execution under `/nix/store` bypass ownership prompts; attempted mutation is denied.
 
 ## Policies
 
@@ -45,9 +46,9 @@ Run `/bash-guard`, choose global or local, and the policy opens directly in `$VI
 
 ## Approval choices
 
-A flagged operation offers one-time approval or refusal with optional context. Choosing persistent ownership asks only for global or local scope, appends the exact path to the required edit/full list, and opens the policy in the external editor at that entry. You may then turn it into a directory glob or add exclusions. Literal unowned deletion may be replaced with `gio trash`.
+A flagged operation offers one-time approval or refusal with an optional follow-up comment. Compound shell input is inspected in lexical shell order and each command requiring permission is presented separately. Choosing persistent ownership asks only for global or local scope, appends the exact path to the required edit/full list, and opens the policy in the external editor at that entry. Literal standalone unowned deletion may be replaced with `gio trash`.
 
-Menus use `j`/`k` or arrow keys to move, `l` or Enter to accept, and `h` to go back one level. Esc and Ctrl-C cancel the entire permission or policy flow; cancelling a permission safely refuses it.
+Menus use `j`/`k` or arrow keys to move, `l` or Enter to accept, and `h` to go back one level. Long command/reason details keep the options visible; use Ctrl-U/Ctrl-D or `g`/`G` to inspect every detail page. Esc and Ctrl-C cancel the entire flow.
 
 ## Limits
 

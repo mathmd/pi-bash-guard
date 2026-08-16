@@ -69,9 +69,11 @@ export class PolicyStore {
   private transientRun = new Set<string>();
   private transientSession = new Set<string>();
   private trustLocal = true;
+  private readonly systemReadonlyRoots: string[];
 
-  constructor(extensionDir: string, cwd: string, home = homedir()) {
+  constructor(extensionDir: string, cwd: string, home = homedir(), systemReadonlyRoots = ["/nix/store"]) {
     this.home = home;
+    this.systemReadonlyRoots = systemReadonlyRoots.map(canonicalPath);
     this.globalPath = join(extensionDir, "policy.json");
     this.cwd = canonicalPath(cwd);
     this.localPath = join(this.cwd, ".pi", "bash-guard.json");
@@ -109,6 +111,11 @@ export class PolicyStore {
   isPolicyPath(path: string): boolean {
     const canonical = canonicalPath(path);
     return canonical === canonicalPath(this.globalPath) || canonical === canonicalPath(this.localPath);
+  }
+
+  isSystemReadonlyPath(path: string): boolean {
+    const canonical = canonicalPath(path);
+    return this.systemReadonlyRoots.some((root) => isWithin(canonical, root));
   }
 
   addCreated(path: string): void {
