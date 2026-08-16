@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { dirname, isAbsolute, join, normalize } from "node:path";
 import { homedir } from "node:os";
 import type { CommandCategory, CommandRule, OwnershipLevel, PolicyFile, PolicyIssue } from "./types.ts";
@@ -70,6 +71,7 @@ export class PolicyStore {
   private transientSession = new Set<string>();
   private trustLocal = true;
   private readonly systemReadonlyRoots: string[];
+  private gitTrackedPaths = new Set<string>();
 
   constructor(extensionDir: string, cwd: string, home = homedir(), systemReadonlyRoots = ["/nix/store"]) {
     this.home = home;
@@ -78,6 +80,7 @@ export class PolicyStore {
     this.cwd = canonicalPath(cwd);
     this.localPath = join(this.cwd, ".pi", "bash-guard.json");
     this.reload(true);
+    this.refreshGitOwnership();
   }
 
   configure(cwd: string, trustLocal: boolean): void {
@@ -85,6 +88,25 @@ export class PolicyStore {
     this.localPath = join(this.cwd, ".pi", "bash-guard.json");
     this.trustLocal = trustLocal;
     this.reload();
+    this.refreshGitOwnership();
+  }
+
+  refreshGitOwnership(): void {
+    this.gitTrackedPaths.clear();
+    const options = { encoding: "utf8" as const, timeout: 2_000, maxBuffer: 32 * 1024 * 1024, windowsHide: true };
+    const rootResult = spawnSync("git", ["-C", this.cwd, "rev-parse", "--show-toplevel"], options);
+    if (rootResult.status !== 0 || !rootResult.stdout.trim()) return;
+    const root = canonicalPath(rootResult.stdout.trim());
+    const filesResult = spawnSync("git", ["-C", root, "ls-files", "--cached", "--full-name", "-z"], options);
+    if (filesResult.status !== 0) return;
+    for (const relativePath of filesResult.stdout.split("\0")) {
+      if (!relativePath) continue;
+      const lexicalPath = normalize(join(root, relativePath));
+      try {
+        if (lstatSync(lexicalPath).isSymbolicLink()) continue;
+      } catch { /* Deleted tracked paths still retain edit ownership. */ }
+      this.gitTrackedPaths.add(canonicalPath(lexicalPath));
+    }
   }
 
   private load(path: string, base: string, scope: PolicyScope): LoadedPolicy {
@@ -165,6 +187,7 @@ export class PolicyStore {
       if (isWithin(canonical, root)) return "edit";
     }
     if (this.includedIn("full", canonical)) return "full";
+    if (this.gitTrackedPaths.has(canonical)) return "edit";
     if (this.includedIn("edit", canonical)) return "edit";
     return "read";
   }

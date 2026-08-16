@@ -135,7 +135,9 @@ async function grantOwnership(
 }
 
 async function refuseWithOptionalComment(ctx: ExtensionContext): Promise<PromptDecision> {
-  const context = await ctx.ui.input("Comment on refusal (optional)", "Leave empty to refuse without a comment");
+  const choice = await menu(ctx, "Command refused. Would you like to attach a comment?", ["Refuse without comment", "Add comment…"], false);
+  if (choice !== "Add comment…") return { action: "refuse" };
+  const context = await ctx.ui.input("Comment on refusal", "Explain why this command was refused");
   return { action: "refuse", ...(context?.trim() ? { context: context.trim() } : {}) };
 }
 

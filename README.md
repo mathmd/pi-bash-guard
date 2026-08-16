@@ -7,11 +7,13 @@ A local Pi extension that combines shell hazard detection with explicit path own
 - Unowned paths are readable unless secret; modifying or executing them asks once.
 - Pi-created paths receive edit ownership until the agent becomes idle.
 - Pi-created paths under `/tmp` retain edit ownership for the Pi session.
+- Git-tracked regular files automatically receive edit ownership, including tracked files currently deleted from the worktree.
 - Edit ownership permits modification/deletion; full ownership additionally permits execution.
 - Secret reads, catastrophic commands, direct `.git` writes, and irreversible unowned deletion are denied.
 - Remote mutations and mutative Git commands always ask.
 - Headless sessions block anything that would ask.
 - Reads and execution under `/nix/store` bypass ownership prompts; attempted mutation is denied.
+- Desktop notifications announce permission prompts and when the agent becomes idle.
 
 ## Policies
 

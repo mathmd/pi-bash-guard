@@ -10,6 +10,7 @@ import { PolicyStore } from "./policy.ts";
 import type { AccessKind, Analysis } from "./types.ts";
 import { strongest } from "./types.ts";
 import { openPolicyManager, promptForDecision } from "./ui.ts";
+import { sendSystemNotification } from "./notifications.ts";
 
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 const PATH_KEYS = /(?:^|_)(?:path|file|filename|directory|dir|cwd|root|target|destination|dest|output)(?:$|_)/i;
@@ -133,6 +134,9 @@ export default function bashGuard(pi: ExtensionAPI): void {
             reasons: [...itemAnalysis.reasons, "Run this deletion separately to use reversible trash substitution"],
           }
         : itemAnalysis;
+      if (ctx.mode === "tui" && ctx.hasUI) {
+        sendSystemNotification("Pi requires permission", `${item.subject}\n${promptAnalysis.reasons.join("\n")}`);
+      }
       const response = await promptForDecision(ctx, policy!, promptAnalysis, item.subject);
       if (response.action === "allow") continue;
       if (response.action === "trash" && isToolCallEventType("bash", event) && itemAnalysis.trashablePaths.length && promptItems.length === 1) {
@@ -158,6 +162,9 @@ export default function bashGuard(pi: ExtensionAPI): void {
     if (record.reloadPolicy) policy.reload();
   });
 
-  pi.on("agent_settled", async () => policy?.clearRunOwnership());
+  pi.on("agent_settled", async () => {
+    policy?.clearRunOwnership();
+    sendSystemNotification("Pi is idle", "The agent has finished and is waiting for input.");
+  });
   pi.on("session_shutdown", async () => policy?.clearSessionOwnership());
 }

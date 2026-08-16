@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { PolicyStore } from "../policy.ts";
@@ -108,5 +109,24 @@ test("Gitignore-style basename and trailing-directory patterns match", () => {
     assert.equal(f.policy.ownership(join(f.workspace, "cache")), "edit");
     assert.equal(f.policy.ownership(join(f.workspace, "cache", "nested.txt")), "edit");
     assert.equal(f.policy.ownership(join(f.workspace, "deep", "value.generated")), "edit");
+  } finally { f.cleanup(); }
+});
+
+test("Git-tracked files receive automatic edit ownership", () => {
+  const f = fixture();
+  try {
+    const tracked = join(f.workspace, "tracked.txt");
+    const untracked = join(f.workspace, "untracked.txt");
+    writeFileSync(tracked, "tracked\n");
+    writeFileSync(untracked, "untracked\n");
+    assert.equal(spawnSync("git", ["-C", f.workspace, "init", "--quiet"]).status, 0);
+    assert.equal(spawnSync("git", ["-C", f.workspace, "add", "--", tracked]).status, 0);
+    f.policy.refreshGitOwnership();
+    assert.equal(f.policy.ownership(tracked), "edit");
+    assert.equal(f.policy.ownership(untracked), "read");
+
+    rmSync(tracked);
+    f.policy.refreshGitOwnership();
+    assert.equal(f.policy.ownership(tracked), "edit");
   } finally { f.cleanup(); }
 });
