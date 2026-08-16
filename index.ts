@@ -1,0 +1,135 @@
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname } from "node:path";
+import { quote as shellQuote } from "shell-quote";
+import type { ExtensionAPI, ToolCallEvent, ToolResultEvent } from "@earendil-works/pi-coding-agent";
+import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
+import { GuardAnalyzer } from "./analyzer.ts";
+import { canonicalPath, containsGitMetadata, looksLikePath, pathExists, resolvePath } from "./path-utils.ts";
+import { PolicyStore } from "./policy.ts";
+import type { AccessKind, Analysis } from "./types.ts";
+import { strongest } from "./types.ts";
+import { openPolicyManager, promptForDecision } from "./ui.ts";
+
+const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
+const PATH_KEYS = /(?:^|_)(?:path|file|filename|directory|dir|cwd|root|target|destination|dest|output)(?:$|_)/i;
+const READ_KEYS = /(?:source|input|read|search|root|cwd)/i;
+
+interface PendingCreation { paths: string[]; reloadPolicy: boolean; }
+
+function genericPathInputs(input: unknown, key = "", out: Array<{ value: string; kind: AccessKind }> = []): Array<{ value: string; kind: AccessKind }> {
+  if (typeof input === "string") {
+    if (PATH_KEYS.test(key) && looksLikePath(input)) out.push({ value: input, kind: READ_KEYS.test(key) ? "read" : "unknown" });
+    return out;
+  }
+  if (Array.isArray(input)) {
+    for (const value of input) genericPathInputs(value, key, out);
+    return out;
+  }
+  if (input && typeof input === "object") {
+    for (const [childKey, value] of Object.entries(input as Record<string, unknown>)) genericPathInputs(value, childKey, out);
+  }
+  return out;
+}
+
+function mergeAnalyses(items: Analysis[]): Analysis {
+  return items.reduce<Analysis>((result, item) => ({
+    decision: strongest(result.decision, item.decision),
+    reasons: [...new Set([...result.reasons, ...item.reasons])],
+    accesses: [...result.accesses, ...item.accesses],
+    creationCandidates: [...new Set([...result.creationCandidates, ...item.creationCandidates])],
+    trashablePaths: [...new Set([...result.trashablePaths, ...item.trashablePaths])],
+    ownershipCandidates: [...result.ownershipCandidates, ...item.ownershipCandidates].filter((candidate, index, all) =>
+      all.findIndex((other) => other.path === candidate.path && other.required === candidate.required) === index),
+  }), { decision: "allow", reasons: [], accesses: [], creationCandidates: [], trashablePaths: [], ownershipCandidates: [] });
+}
+
+function analyzeTool(event: ToolCallEvent, cwd: string, analyzer: GuardAnalyzer, policy: PolicyStore): Analysis {
+  if (isToolCallEventType("bash", event)) return analyzer.analyzeCommand(event.input.command, cwd);
+  if (isToolCallEventType("read", event)) return analyzer.analyzePathAccess(event.input.path, "read", cwd, "read");
+  if (isToolCallEventType("write", event)) {
+    const path = canonicalPath(resolvePath(event.input.path, cwd, policy.home));
+    if (policy.isPolicyPath(path) || containsGitMetadata(path) || pathExists(path)) {
+      return analyzer.analyzePathAccess(path, "edit", cwd, "write");
+    }
+    return { decision: "allow", reasons: [], accesses: [], creationCandidates: [path], trashablePaths: [], ownershipCandidates: [] };
+  }
+  if (isToolCallEventType("edit", event)) return analyzer.analyzePathAccess(event.input.path, "edit", cwd, "edit");
+  if (isToolCallEventType("grep", event) || isToolCallEventType("find", event) || isToolCallEventType("ls", event)) {
+    return analyzer.analyzePathAccess(event.input.path ?? ".", "read", cwd, event.toolName);
+  }
+  const paths = genericPathInputs(event.input);
+  if (!paths.length) return { decision: "allow", reasons: [], accesses: [], creationCandidates: [], trashablePaths: [], ownershipCandidates: [] };
+  return mergeAnalyses(paths.map((item) => analyzer.analyzePathAccess(item.value, item.kind, cwd, event.toolName)));
+}
+
+function subjectFor(event: ToolCallEvent): string {
+  if (isToolCallEventType("bash", event)) return `Command:\n${event.input.command}`;
+  return `Tool: ${event.toolName}\nInput contains protected or unowned path access.`;
+}
+
+export default function bashGuard(pi: ExtensionAPI): void {
+  let policy: PolicyStore | undefined;
+  let analyzer: GuardAnalyzer | undefined;
+  const pending = new Map<string, PendingCreation>();
+
+  function configure(cwd: string, trustLocal: boolean): void {
+    if (!policy) {
+      policy = new PolicyStore(EXTENSION_DIR, cwd);
+      analyzer = new GuardAnalyzer(policy);
+    }
+    policy.configure(cwd, trustLocal);
+  }
+
+  pi.registerCommand("bash-guard", {
+    description: "Open the global or local bash-guard policy in your editor",
+    handler: async (_args, ctx) => {
+      configure(ctx.cwd, ctx.isProjectTrusted());
+      await openPolicyManager(ctx, policy!);
+    },
+  });
+
+  pi.on("session_start", async (_event, ctx) => {
+    configure(ctx.cwd, ctx.isProjectTrusted());
+    policy!.clearSessionOwnership();
+    const issues = policy!.getIssues();
+    if (issues.length) ctx.ui.notify(`bash-guard policy issue: ${issues.map((issue) => issue.message).join("; ")}`, "warning");
+  });
+
+  pi.on("tool_call", async (event, ctx) => {
+    configure(ctx.cwd, ctx.isProjectTrusted());
+    const analysis = analyzeTool(event, ctx.cwd, analyzer!, policy!);
+    if (analysis.creationCandidates.length) {
+      pending.set(event.toolCallId, {
+        paths: analysis.creationCandidates.filter((path) => !existsSync(path)),
+        reloadPolicy: analysis.creationCandidates.some((path) => policy!.isPolicyPath(path)),
+      });
+    }
+    if (analysis.decision === "allow") return;
+
+    const response = await promptForDecision(ctx, policy!, analysis, subjectFor(event));
+    if (response.action === "allow") return;
+    if (response.action === "trash" && isToolCallEventType("bash", event) && analysis.trashablePaths.length) {
+      // Replace, rather than execute inside the hook, so Pi records the actual reversible operation.
+      event.input.command = shellQuote(["gio", "trash", "--", ...analysis.trashablePaths]);
+      pending.delete(event.toolCallId);
+      return;
+    }
+    pending.delete(event.toolCallId);
+    return {
+      block: true,
+      reason: `Blocked by bash-guard.${response.context ? ` User context: ${response.context}` : ""} ${analysis.reasons.join(" ")}`,
+    };
+  });
+
+  pi.on("tool_result", async (event: ToolResultEvent) => {
+    const record = pending.get(event.toolCallId);
+    pending.delete(event.toolCallId);
+    if (!record || event.isError || !policy) return;
+    for (const path of record.paths) if (pathExists(path)) policy.addCreated(path);
+    if (record.reloadPolicy) policy.reload();
+  });
+
+  pi.on("agent_settled", async () => policy?.clearRunOwnership());
+  pi.on("session_shutdown", async () => policy?.clearSessionOwnership());
+}

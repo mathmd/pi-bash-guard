@@ -1,0 +1,14 @@
+{
+  "name": "local-pi-bash-guard",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "shell-quote": "^1.8.3"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.ts"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}

@@ -1,0 +1,9 @@
+node_modules/
+dist/
+coverage/
+*.log
+Plan.md
+progress.log
+policy.json
+*.tmp-*
+.DS_Store
