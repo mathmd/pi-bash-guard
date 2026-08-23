@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 
 export function expandHome(value: string, home: string): string {
@@ -38,6 +38,14 @@ export function pathExists(path: string): boolean {
   try {
     lstatSync(path);
     return true;
+  } catch {
+    return false;
+  }
+}
+
+export function pathIsDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
   } catch {
     return false;
   }

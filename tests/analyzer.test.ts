@@ -129,6 +129,64 @@ test("new creation is allowed and an existing unowned edit asks", () => {
   } finally { f.cleanup(); }
 });
 
+test("copy analysis expands prior assignments and checks concrete destination files", () => {
+  const f = fixture();
+  try {
+    const source = join(f.systemReadonly, "katex");
+    const destination = join(f.workspace, "assets", "katex");
+    mkdirSync(join(source, "contrib"), { recursive: true });
+    mkdirSync(join(source, "fonts"));
+    writeFileSync(join(source, "katex.min.js"), "js");
+    writeFileSync(join(source, "katex.min.css"), "css");
+    writeFileSync(join(source, "contrib", "auto-render.min.js"), "auto");
+    writeFileSync(join(source, "fonts", "font.woff2"), "font");
+    const command = [
+      "set -eu",
+      `src=${source}`,
+      `dst=${destination}`,
+      'mkdir -p "$dst/contrib"',
+      'cp "$src/katex.min.js" "$src/katex.min.css" "$dst/"',
+      'cp "$src/contrib/auto-render.min.js" "$dst/contrib/"',
+      'cp -R "$src/fonts" "$dst/"',
+      'find "$dst" -type f | wc -l',
+    ].join("\n");
+    const units = f.analyzer.analyzeCommandUnits(command, f.workspace);
+    assert.deepEqual(units.filter((unit) => unit.analysis.decision !== "allow"), []);
+    const copyCreations = units.filter((unit) => unit.command.startsWith("cp "))
+      .flatMap((unit) => unit.analysis.creationCandidates);
+    assert.deepEqual(copyCreations, [
+      join(destination, "katex.min.js"),
+      join(destination, "katex.min.css"),
+      join(destination, "contrib", "auto-render.min.js"),
+      join(destination, "fonts"),
+      join(destination, "fonts", "font.woff2"),
+    ]);
+    assert.equal(copyCreations.includes(destination), false);
+
+    mkdirSync(join(destination, "contrib"), { recursive: true });
+    const existingTarget = join(destination, "contrib", "auto-render.min.js");
+    writeFileSync(existingTarget, "old");
+    const overwrite = f.analyzer.analyzeCommandUnits([
+      `src=${source}`,
+      `dst=${destination}`,
+      'cp "$src/contrib/auto-render.min.js" "$dst/contrib/"',
+    ].join("\n"), f.workspace).at(-1)!.analysis;
+    assert.equal(overwrite.decision, "ask");
+    assert.deepEqual(overwrite.ownershipCandidates, [{ path: existingTarget, required: "edit" }]);
+
+    const existingFont = join(destination, "fonts", "font.woff2");
+    mkdirSync(join(destination, "fonts"));
+    writeFileSync(existingFont, "old-font");
+    const recursiveOverwrite = f.analyzer.analyzeCommandUnits([
+      `src=${source}`,
+      `dst=${destination}`,
+      'cp -R "$src/fonts" "$dst/"',
+    ].join("\n"), f.workspace).at(-1)!.analysis;
+    assert.equal(recursiveOverwrite.decision, "ask");
+    assert.deepEqual(recursiveOverwrite.ownershipCandidates, [{ path: existingFont, required: "edit" }]);
+  } finally { f.cleanup(); }
+});
+
 test("edit ownership permits editing and deletion but still asks execution", () => {
   const f = fixture();
   try {

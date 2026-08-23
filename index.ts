@@ -46,7 +46,9 @@ function mergeAnalyses(items: Analysis[]): Analysis {
 }
 
 function analyzeTool(event: ToolCallEvent, cwd: string, analyzer: GuardAnalyzer, policy: PolicyStore): Analysis {
-  if (isToolCallEventType("bash", event)) return analyzer.analyzeCommand(event.input.command, cwd);
+  if (isToolCallEventType("bash", event)) {
+    return mergeAnalyses(analyzer.analyzeCommandUnits(event.input.command, cwd).map((unit) => unit.analysis));
+  }
   if (isToolCallEventType("read", event)) return analyzer.analyzePathAccess(event.input.path, "read", cwd, "read");
   if (isToolCallEventType("write", event)) {
     const path = canonicalPath(resolvePath(event.input.path, cwd, policy.home));
@@ -108,24 +110,28 @@ export default function bashGuard(pi: ExtensionAPI): void {
     }
     if (analysis.decision === "allow") return;
 
-    let promptItems: Array<{ subject: string; analysis: Analysis; command?: string }>;
+    let promptItems: Array<{ subject: string; analysis: Analysis; unitIndex?: number }>;
     if (isToolCallEventType("bash", event)) {
       const units = analyzer!.analyzeCommandUnits(event.input.command, ctx.cwd)
+        .map((unit, unitIndex) => ({ ...unit, unitIndex }))
         .filter((unit) => unit.analysis.decision !== "allow");
       const combined = units.reduce((decision, unit) => strongest(decision, unit.analysis.decision), "allow" as Analysis["decision"]);
       promptItems = strongest(combined, analysis.decision) === combined
         ? units.map((unit, index) => ({
             subject: `Command requiring permission (${index + 1}/${units.length}, shell order):\n${unit.command}`,
             analysis: unit.analysis,
-            command: unit.command,
+            unitIndex: unit.unitIndex,
           }))
-        : [{ subject: subjectFor(event), analysis, command: event.input.command }];
+        : [{ subject: subjectFor(event), analysis }];
     } else {
       promptItems = [{ subject: subjectFor(event), analysis }];
     }
 
     for (const item of promptItems) {
-      const itemAnalysis = item.command ? analyzer!.analyzeCommand(item.command, ctx.cwd) : item.analysis;
+      const refreshedUnit = item.unitIndex !== undefined && isToolCallEventType("bash", event)
+        ? analyzer!.analyzeCommandUnits(event.input.command, ctx.cwd)[item.unitIndex]
+        : undefined;
+      const itemAnalysis = refreshedUnit?.analysis ?? item.analysis;
       if (itemAnalysis.decision === "allow") continue;
       const promptAnalysis = promptItems.length > 1 && itemAnalysis.trashablePaths.length
         ? {

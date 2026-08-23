@@ -1,9 +1,9 @@
-import { readFileSync } from "node:fs";
-import { basename } from "node:path";
+import { lstatSync, readFileSync, readdirSync } from "node:fs";
+import { basename, join } from "node:path";
 import { parse as shellParse, type ParseToken } from "shell-quote";
 import type { AccessKind, Analysis, CommandCategory, Decision, PathAccess } from "./types.ts";
 import { strongest } from "./types.ts";
-import { canonicalPath, containsGitMetadata, looksLikePath, pathExists, resolvePath } from "./path-utils.ts";
+import { canonicalPath, containsGitMetadata, looksLikePath, pathExists, pathIsDirectory, resolvePath } from "./path-utils.ts";
 import type { PolicyStore } from "./policy.ts";
 import { builtinCommandCategory, SHELL_CLOSING_WORDS, SHELL_HEADER_WORDS, SHELL_PREFIX_WORDS } from "./command-catalog.ts";
 
@@ -202,6 +202,49 @@ export function splitShellCommandUnits(command: string): string[] {
   return units.length ? units : [command.trim()].filter(Boolean);
 }
 
+type ShellEnvironment = Record<string, string>;
+
+function shellEnvironmentResolver(environment: ShellEnvironment, home: string): (key: string) => string {
+  return (key) => environment[key] ?? (key === "HOME" ? home : `$${key}`);
+}
+
+function persistentAssignmentUpdates(command: string, environment: ShellEnvironment, home: string): ShellEnvironment | undefined {
+  let tokens: ParseToken[];
+  try { tokens = shellParse(command, shellEnvironmentResolver(environment, home)) as ParseToken[]; }
+  catch { return undefined; }
+  const words = tokens.filter((token): token is string => typeof token === "string");
+  if (words.length !== tokens.length) return undefined;
+  const assignments = ["export", "readonly", "declare", "typeset"].includes(words[0] ?? "") ? words.slice(1) : words;
+  if (!assignments.length) return undefined;
+  const updates: ShellEnvironment = {};
+  for (const assignment of assignments) {
+    const match = assignment.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s);
+    if (!match) return undefined;
+    updates[match[1]!] = match[2]!;
+  }
+  return updates;
+}
+
+function recursiveCopyTargets(source: string, destination: string, limit = 10_000): string[] {
+  const targets: string[] = [];
+  const walk = (sourcePath: string, destinationPath: string): void => {
+    if (targets.length >= limit) throw new Error("copy target limit exceeded");
+    const stat = lstatSync(sourcePath);
+    if (!stat.isDirectory()) {
+      targets.push(destinationPath);
+      return;
+    }
+    if (!pathExists(destinationPath)) targets.push(destinationPath);
+    for (const entry of readdirSync(sourcePath)) walk(join(sourcePath, entry), join(destinationPath, entry));
+  };
+  try {
+    walk(source, destination);
+    return targets;
+  } catch {
+    return [destination];
+  }
+}
+
 export class GuardAnalyzer {
   private readonly policy: PolicyStore;
 
@@ -214,7 +257,13 @@ export class GuardAnalyzer {
   }
 
   analyzeCommandUnits(command: string, cwd: string): CommandAnalysisUnit[] {
-    return splitShellCommandUnits(command).map((unit) => ({ command: unit, analysis: this.analyzeCommand(unit, cwd) }));
+    const environment: ShellEnvironment = {};
+    return splitShellCommandUnits(command).map((unit) => {
+      const analysis = this.analyzeCommand(unit, cwd, environment);
+      const updates = persistentAssignmentUpdates(unit, environment, this.policy.home);
+      if (updates) Object.assign(environment, updates);
+      return { command: unit, analysis };
+    });
   }
 
   analyzePathAccess(path: string, kind: AccessKind, cwd: string, source: string, literal = true): Analysis {
@@ -223,13 +272,15 @@ export class GuardAnalyzer {
     return this.finalize([{ path: this.path(path, cwd), kind, source, literal }], [], [], []);
   }
 
-  analyzeCommand(command: string, cwd: string): Analysis {
+  analyzeCommand(command: string, cwd: string, shellEnvironment: ShellEnvironment = {}): Analysis {
     for (const [pattern, reason] of CATASTROPHIC) {
       if (pattern.test(command)) return this.result("deny", [`Catastrophic operation: ${reason}`]);
     }
 
     let tokens: ParseToken[];
-    try { tokens = shellParse(command.replace(/\n/g, " ; ")) as ParseToken[]; }
+    try {
+      tokens = shellParse(command.replace(/\n/g, " ; "), shellEnvironmentResolver(shellEnvironment, this.policy.home)) as ParseToken[];
+    }
     catch { return this.result("ask", ["Shell syntax could not be analyzed safely"]); }
 
     const accesses: PathAccess[] = [];
@@ -383,11 +434,28 @@ export class GuardAnalyzer {
       if (cmd === "cp" || cmd === "install") {
         const positional = args.filter((value) => !value.startsWith("-"));
         if (positional.length >= 2) {
-          for (const src of positional.slice(0, -1)) accesses.push({ path: this.path(src, cwd), kind: "read", source: cmd, literal: true });
-          const dest = this.path(positional.at(-1)!, cwd);
-          if (pathExists(dest)) accesses.push({ path: dest, kind: "edit", source: cmd, literal: true, existed: true });
-          else creations.push(dest);
-        } else { baseDecision = strongest(baseDecision, "ask"); reasons.push(`Unable to resolve ${cmd} targets`); }
+          const sourceArgs = positional.slice(0, -1);
+          const destinationArg = positional.at(-1)!;
+          for (const source of sourceArgs) {
+            accesses.push({ path: this.path(source, cwd), kind: "read", source: cmd, literal: true });
+          }
+          const destination = this.path(destinationArg, cwd);
+          const destinationIsDirectory = sourceArgs.length > 1 || /[/\\]$/.test(destinationArg) || pathIsDirectory(destination);
+          const baseTargets = destinationIsDirectory
+            ? sourceArgs.map((source) => canonicalPath(join(destination, basename(source))))
+            : [destination];
+          const recursive = args.some((arg) => arg === "--recursive" || /^-[^-]*[Rr]/.test(arg));
+          const targets = sourceArgs.flatMap((source, index) => recursive
+            ? recursiveCopyTargets(this.path(source, cwd), baseTargets[index] ?? destination)
+            : [baseTargets[index] ?? destination]);
+          for (const target of targets) {
+            if (pathExists(target)) accesses.push({ path: target, kind: "edit", source: cmd, literal: true, existed: true });
+            else creations.push(target);
+          }
+        } else {
+          baseDecision = strongest(baseDecision, "ask");
+          reasons.push(`Unable to resolve ${cmd} targets`);
+        }
         continue;
       }
 
@@ -422,7 +490,7 @@ export class GuardAnalyzer {
           arg === "-c" || arg === "-e" || arg === "--eval" ||
           (["bash", "sh", "zsh", "fish"].includes(cmd) && /^-[^-]*c/.test(arg)));
         if (cIndex >= 0 && args[cIndex + 1]) {
-          const nested = this.analyzeCommand(args[cIndex + 1], cwd);
+          const nested = this.analyzeCommand(args[cIndex + 1], cwd, shellEnvironment);
           baseDecision = strongest(baseDecision, nested.decision);
           reasons.push(...nested.reasons);
           accesses.push(...nested.accesses);
@@ -450,7 +518,7 @@ export class GuardAnalyzer {
             baseDecision = strongest(baseDecision, "ask");
             reasons.push(`Unknown system command ${cmd} requires approval`);
           } else {
-            const categorized = this.analyzeCategorizedCommand(systemCategory, cmd, args, cwd);
+            const categorized = this.analyzeCategorizedCommand(systemCategory, cmd, args, cwd, shellEnvironment);
             baseDecision = strongest(baseDecision, categorized.decision);
             reasons.push(...categorized.reasons);
             accesses.push(...categorized.accesses);
@@ -465,7 +533,7 @@ export class GuardAnalyzer {
 
       const category = this.policy.commandCategory(cmd) ?? builtinCommandCategory(cmd);
       if (category) {
-        const categorized = this.analyzeCategorizedCommand(category, cmd, args, cwd);
+        const categorized = this.analyzeCategorizedCommand(category, cmd, args, cwd, shellEnvironment);
         baseDecision = strongest(baseDecision, categorized.decision);
         reasons.push(...categorized.reasons);
         accesses.push(...categorized.accesses);
@@ -491,13 +559,14 @@ export class GuardAnalyzer {
     command: string,
     args: string[],
     cwd: string,
+    shellEnvironment: ShellEnvironment,
   ): Analysis {
     if (category === "deny") return this.result("deny", [`Command ${command} is registered as prohibited`]);
     if (category === "allow") return this.result("allow", []);
     if (category === "remote") return this.result("ask", [`${command} may mutate remote or managed state`]);
 
     if (category === "execute" && (command === "eval" || command === "source" || command === ".")) {
-      if (command === "eval") return this.analyzeCommand(args.join(" "), cwd);
+      if (command === "eval") return this.analyzeCommand(args.join(" "), cwd, shellEnvironment);
       const script = args.find((arg) => !arg.startsWith("-"));
       return script
         ? this.analyzePathAccess(script, "execute", cwd, command)

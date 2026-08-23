@@ -12,6 +12,7 @@ A local Pi extension that combines shell hazard detection with explicit path own
 - Secret reads, catastrophic commands, direct `.git` writes, and irreversible unowned deletion are denied.
 - Remote mutations and mutative Git/systemd commands always ask; filesystem searches, systemd inspection, common network diagnostics, and read-only IPP attribute queries do not.
 - Wrappers such as `timeout` inherit the classification of the command they run.
+- Persistent shell assignments are resolved across compound commands; copy operations check concrete destination files rather than requiring ownership of the destination directory.
 - Headless sessions block anything that would ask.
 - Reads and execution under `/nix/store` bypass ownership prompts; attempted mutation is denied.
 - Standard process I/O endpoints such as `/dev/null`, standard streams, and file descriptors 0–2 bypass ownership checks when used for I/O.
