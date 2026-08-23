@@ -10,7 +10,7 @@ import { builtinCommandCategory, SHELL_CLOSING_WORDS, SHELL_HEADER_WORDS, SHELL_
 type OpToken = { op: string };
 type GlobToken = { op: "glob"; pattern: string };
 const CONTROL_OPS = new Set(["|", "|&", "&&", "||", ";", "&", "(", ")"]);
-const REDIRECT_OPS = new Set([">", ">>", "1>", "1>>", "2>", "2>>", "&>", "<"]);
+const REDIRECT_OPS = new Set([">", ">>", "1>", "1>>", "2>", "2>>", "&>", "&>>", ">&", "<&", "<<<", "<"]);
 const INTERPRETERS = new Set(["bash", "sh", "zsh", "fish", "python", "python3", "node", "ruby", "perl", "deno", "bun"]);
 const GIT_READ_SUBCOMMANDS = new Set([
   "status", "diff", "diff-files", "diff-index", "diff-tree", "log", "show", "rev-parse", "ls-files", "grep",
@@ -170,6 +170,7 @@ export function splitShellCommandUnits(command: string): string[] {
     if (parentheses > 0) continue;
 
     const two = command.slice(index, index + 2);
+    if (char === "&" && ([">", "<"].includes(command[index - 1] ?? "") || command[index + 1] === ">")) continue;
     const operatorLength = ["&&", "||", "|&", ";;"].includes(two) ? 2 : [";", "|", "&", "\n"].includes(char) ? 1 : 0;
     if (!operatorLength) continue;
     push(index);
@@ -246,7 +247,19 @@ export class GuardAnalyzer {
         else continue;
       }
       while (SHELL_PREFIX_WORDS.has(commandName(strings[index] ?? ""))) index++;
-      while (["env", "command", "exec", "nohup"].includes(commandName(strings[index] ?? ""))) {
+      while (true) {
+        const wrapper = commandName(strings[index] ?? "");
+        if (wrapper === "timeout") {
+          index++;
+          while (strings[index]?.startsWith("-")) {
+            const option = strings[index++]!;
+            if (["-k", "--kill-after", "-s", "--signal"].includes(option)) index++;
+            if (option === "--") break;
+          }
+          if (strings[index]) index++; // duration
+          continue;
+        }
+        if (!["env", "command", "exec", "nohup"].includes(wrapper)) break;
         index++;
         while (strings[index]?.startsWith("-")) index++;
         while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(strings[index] ?? "")) index++;
@@ -285,6 +298,21 @@ export class GuardAnalyzer {
               accesses.push({ path: candidate, kind: "read", source: "git", literal: true, existed: pathExists(candidate) });
             }
           }
+        }
+        continue;
+      }
+
+      if (cmd === "ipptool") {
+        const candidates = args.filter((arg) =>
+          !arg.startsWith("-") && !/^(?:ipps?|https?):\/\//i.test(arg) &&
+          (/\.test$/i.test(arg) || looksLikePath(arg) || pathExists(this.path(arg, cwd))));
+        const safeQuery = !args.includes("-") && candidates.every((arg) => /^(?:get|list|identify|validate)[\w-]*\.test$/i.test(basename(arg)));
+        if (!safeQuery) {
+          baseDecision = strongest(baseDecision, "ask");
+          reasons.push("ipptool test may perform a mutative printer operation");
+        }
+        for (const arg of candidates.filter((value) => looksLikePath(value) || pathExists(this.path(value, cwd)))) {
+          accesses.push({ path: this.path(arg, cwd), kind: "read", source: "ipptool", literal: true });
         }
         continue;
       }

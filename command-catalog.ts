@@ -16,6 +16,7 @@ const ALLOW = new Set([
   "printf", "echo", "pwd", "basename", "dirname", "yes", "sleep", "seq",
   "clear", "tput", "stty", "tty", "logname", "whoami", "id", "groups", "who", "w", "uptime", "date",
   "cal", "nproc", "arch", "uname", "hostname", "hostid", "getconf", "locale", "printenv", "env",
+  "ping", "ping6", "traceroute", "tracepath", "mtr", "dig", "host", "nslookup",
 ]);
 
 const READ = new Set([

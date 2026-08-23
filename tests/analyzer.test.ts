@@ -70,6 +70,29 @@ test("compound shell commands are separated in lexical permission order", () => 
   } finally { f.cleanup(); }
 });
 
+test("network diagnostics keep fd redirections attached and remain non-mutative", () => {
+  const f = fixture();
+  try {
+    const output = join(f.workspace, "probe.out");
+    const command = [
+      "printf '%s\\n' '=== reachability ==='",
+      "ping -c 2 -W 2 192.0.2.1 2>&1 || true",
+      `for p in 80 631; do timeout 2 bash -c "true" > ${output} 2>&1 && echo "port $p open" || echo "port $p closed"; done`,
+      "ipptool -tv ipp://192.0.2.1:631/ipp/print get-printer-attributes.test 2>&1 | tail -30 || true",
+    ].join("\n");
+    const units = splitShellCommandUnits(command);
+    assert.equal(units.includes("1"), false);
+    assert.equal(units.includes("2"), false);
+    const requiringPermission = f.analyzer.analyzeCommandUnits(command, f.workspace)
+      .filter((unit) => unit.analysis.decision !== "allow");
+    assert.deepEqual(requiringPermission, []);
+    assert.equal(
+      f.analyzer.analyzeCommand("ipptool ipp://192.0.2.1/ipp/print print-job.test", f.workspace).decision,
+      "ask",
+    );
+  } finally { f.cleanup(); }
+});
+
 test("new creation is allowed and an existing unowned edit asks", () => {
   const f = fixture();
   try {

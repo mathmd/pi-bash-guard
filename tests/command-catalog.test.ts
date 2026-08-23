@@ -6,6 +6,7 @@ test("common shell and Unix commands have conservative categories", () => {
   assert.equal(builtinCommandCategory("cd"), "allow");
   assert.equal(builtinCommandCategory("exit"), "allow");
   assert.equal(builtinCommandCategory("set"), "allow");
+  assert.equal(builtinCommandCategory("ping"), "allow");
   assert.equal(builtinCommandCategory("tee"), "edit");
   assert.equal(builtinCommandCategory("cat"), "read");
   assert.equal(builtinCommandCategory("mkdir"), "create");
