@@ -234,8 +234,31 @@ test("direct .git writes deny while new ordinary redirection is attributable", (
 test("find mutation is not mistaken for a read-only search", () => {
   const f = fixture();
   try {
+    assert.equal(f.analyzer.analyzeCommand(`find ${f.workspace} -maxdepth 2 -type f -print`, f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand(`find ${f.workspace} -printf '%p\\n'`, f.workspace).decision, "allow");
     assert.equal(f.analyzer.analyzeCommand("find . -delete", f.workspace).decision, "deny");
     assert.equal(f.analyzer.analyzeCommand("find . -exec echo {} ;", f.workspace).decision, "ask");
+    assert.equal(f.analyzer.analyzeCommand("find . -ok echo {} ;", f.workspace).decision, "ask");
+  } finally { f.cleanup(); }
+});
+
+test("systemctl inspection and timeout wrappers preserve read-only classification", () => {
+  const f = fixture();
+  try {
+    const readOnly = [
+      "systemctl --user --no-pager --full status example.service",
+      "systemctl --system --no-pager cat example.service",
+      "systemctl --type service --state running --no-pager",
+      "systemctl -p ActiveState --value show example.service",
+      `timeout 5s find ${f.workspace} -maxdepth 1 -type f -print`,
+      "timeout --foreground 5s systemctl --user status example.service",
+      `timeout -k 1s 5s bash -lc "find ${f.workspace} -maxdepth 1 -print"`,
+    ];
+    for (const command of readOnly) {
+      assert.equal(f.analyzer.analyzeCommand(command, f.workspace).decision, "allow", command);
+    }
+    assert.equal(f.analyzer.analyzeCommand("systemctl --user restart example.service", f.workspace).decision, "ask");
+    assert.equal(f.analyzer.analyzeCommand("timeout 5s systemctl stop example.service", f.workspace).decision, "ask");
   } finally { f.cleanup(); }
 });
 

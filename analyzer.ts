@@ -91,6 +91,27 @@ function isReadOnlyGitOperation(invocation: GitInvocation): boolean {
   if (sub === "fsck") return !args.includes("--lost-found") && !args.includes("--write-commit-graph");
   return false;
 }
+const SYSTEMCTL_READ_SUBCOMMANDS = new Set([
+  "status", "show", "cat", "list-units", "list-unit-files", "list-sockets", "list-timers", "list-dependencies",
+  "list-jobs", "list-machines", "list-paths", "list-automounts", "is-active", "is-failed", "is-enabled",
+  "is-system-running", "get-default", "help",
+]);
+const SYSTEMCTL_VALUE_OPTIONS = new Set([
+  "-H", "--host", "-M", "--machine", "-t", "--type", "--state", "-p", "--property", "-n", "--lines",
+  "-o", "--output", "--root", "--image", "--kill-whom", "--signal",
+]);
+
+function isReadOnlySystemctl(args: string[]): boolean {
+  let index = 0;
+  while (index < args.length && args[index]!.startsWith("-")) {
+    const option = args[index++]!;
+    if (["--version", "--help", "-h"].includes(option)) return true;
+    if (SYSTEMCTL_VALUE_OPTIONS.has(option)) index++;
+  }
+  const subcommand = args[index] ?? "list-units";
+  return SYSTEMCTL_READ_SUBCOMMANDS.has(subcommand);
+}
+
 const CATASTROPHIC: Array<[RegExp, string]> = [
   [/\b(?:mkfs(?:\.\w+)?|newfs_\w+|wipefs)\b/, "filesystem formatting or signature destruction"],
   [/\bdd\b[^\n]*\bof=\/dev\//, "raw device write"],
@@ -317,6 +338,14 @@ export class GuardAnalyzer {
         continue;
       }
 
+      if (cmd === "systemctl") {
+        if (!isReadOnlySystemctl(args)) {
+          baseDecision = strongest(baseDecision, "ask");
+          reasons.push("Mutative or unknown systemctl operation requires approval");
+        }
+        continue;
+      }
+
       if (cmd === "rm" || cmd === "rmdir" || cmd === "unlink") {
         for (const arg of args.filter((value) => !value.startsWith("-"))) {
           if (!looksLikePath(arg) && !/[*?\[]/.test(arg) && !pathExists(this.path(arg, cwd))) continue;
@@ -362,13 +391,13 @@ export class GuardAnalyzer {
         continue;
       }
 
-      if (cmd === "find" && (args.includes("-delete") || args.includes("-exec") || args.includes("-execdir"))) {
-        const root = args.find((arg) => !arg.startsWith("-")) ?? ".";
+      if (cmd === "find" && args.some((arg) => ["-delete", "-exec", "-execdir", "-ok", "-okdir"].includes(arg))) {
+        const root = args[0] && !args[0].startsWith("-") ? args[0] : ".";
         if (args.includes("-delete")) {
           accesses.push({ path: this.path(root, cwd), kind: "delete", source: "find", literal: false, existed: pathExists(this.path(root, cwd)) });
         } else {
           baseDecision = strongest(baseDecision, "ask");
-          reasons.push("find -exec/-execdir executes a nested command");
+          reasons.push("find -exec/-execdir/-ok/-okdir executes a nested command");
           accesses.push({ path: this.path(root, cwd), kind: "read", source: "find", literal: true });
         }
         continue;
@@ -383,7 +412,9 @@ export class GuardAnalyzer {
       }
 
       if (INTERPRETERS.has(cmd)) {
-        const cIndex = args.findIndex((arg) => arg === "-c" || arg === "-e");
+        const cIndex = args.findIndex((arg) =>
+          arg === "-c" || arg === "-e" || arg === "--eval" ||
+          (["bash", "sh", "zsh", "fish"].includes(cmd) && /^-[^-]*c/.test(arg)));
         if (cIndex >= 0 && args[cIndex + 1]) {
           const nested = this.analyzeCommand(args[cIndex + 1], cwd);
           baseDecision = strongest(baseDecision, nested.decision);
