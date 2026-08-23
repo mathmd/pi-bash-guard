@@ -12,9 +12,12 @@ function fixture() {
   const workspace = join(root, "workspace");
   const home = join(root, "home");
   const systemReadonly = join(root, "nix", "store");
-  mkdirSync(extension); mkdirSync(workspace); mkdirSync(home); mkdirSync(systemReadonly, { recursive: true });
-  const policy = new PolicyStore(extension, workspace, home, [systemReadonly]);
-  return { root, workspace, systemReadonly, policy, analyzer: new GuardAnalyzer(policy), cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  const processDevice = join(root, "device");
+  const processFds = join(root, "process-fds");
+  mkdirSync(extension); mkdirSync(workspace); mkdirSync(home);
+  mkdirSync(systemReadonly, { recursive: true }); mkdirSync(processDevice); mkdirSync(processFds);
+  const policy = new PolicyStore(extension, workspace, home, [systemReadonly], { deviceRoot: processDevice, processFdRoot: processFds });
+  return { root, workspace, systemReadonly, processDevice, processFds, policy, analyzer: new GuardAnalyzer(policy), cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 test("read-only command is allowed but secret read is denied", () => {
@@ -25,6 +28,26 @@ test("read-only command is allowed but secret read is denied", () => {
     writeFileSync(plain, "plain"); writeFileSync(secret, "SECRET=test");
     assert.equal(f.analyzer.analyzeCommand(`cat ${plain}`, f.workspace).decision, "allow");
     assert.equal(f.analyzer.analyzeCommand(`cat ${secret}`, f.workspace).decision, "deny");
+  } finally { f.cleanup(); }
+});
+
+test("process I/O redirections do not create ownership prompts", () => {
+  const f = fixture();
+  try {
+    const config = join(f.workspace, "config");
+    const data = join(f.workspace, "data");
+    const sink = join(f.processDevice, "null");
+    mkdirSync(config); mkdirSync(data);
+    const command = `rg -n "stylua|--lsp" ${config} ${data} 2>${sink}`;
+    assert.equal(f.analyzer.analyzeCommand(command, f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzePathAccess(sink, "edit", f.workspace, "write").decision, "allow");
+    assert.equal(f.analyzer.analyzePathAccess(sink, "delete", f.workspace, "delete").decision, "deny");
+    assert.equal(f.analyzer.analyzeCommand("printf value 2>&1", f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand("grep value <<< '.env'", f.workspace).decision, "allow");
+
+    const ordinaryOutput = join(f.workspace, "existing.log");
+    writeFileSync(ordinaryOutput, "old\n");
+    assert.equal(f.analyzer.analyzeCommand(`printf value > ${ordinaryOutput}`, f.workspace).decision, "ask");
   } finally { f.cleanup(); }
 });
 

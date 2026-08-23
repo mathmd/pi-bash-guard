@@ -218,6 +218,8 @@ export class GuardAnalyzer {
   }
 
   analyzePathAccess(path: string, kind: AccessKind, cwd: string, source: string, literal = true): Analysis {
+    const lexicalPath = resolvePath(path, cwd, this.policy.home);
+    if (["read", "edit"].includes(kind) && this.policy.isSafeProcessIoPath(lexicalPath)) return this.result("allow", []);
     return this.finalize([{ path: this.path(path, cwd), kind, source, literal }], [], [], []);
   }
 
@@ -247,10 +249,14 @@ export class GuardAnalyzer {
         if (isOp(token) && REDIRECT_OPS.has(token.op)) {
           const target = segment[i + 1];
           if (typeof target === "string") {
-            const path = this.path(target, cwd);
-            if (token.op === "<") accesses.push({ path, kind: "read", source: "redirection", literal: true });
-            else if (pathExists(path)) accesses.push({ path, kind: "edit", source: "redirection", literal: true, existed: true });
-            else creations.push(path);
+            const descriptorTarget = [">&", "<&"].includes(token.op) && /^(?:\d+|-)$/.test(target);
+            const lexicalPath = resolvePath(target, cwd, this.policy.home);
+            if (token.op !== "<<<" && !descriptorTarget && !this.policy.isSafeProcessIoPath(lexicalPath)) {
+              const path = this.path(target, cwd);
+              if (token.op === "<") accesses.push({ path, kind: "read", source: "redirection", literal: true });
+              else if (pathExists(path)) accesses.push({ path, kind: "edit", source: "redirection", literal: true, existed: true });
+              else creations.push(path);
+            }
             i++;
           }
           continue;

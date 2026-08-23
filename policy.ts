@@ -1,6 +1,6 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, isAbsolute, join, normalize } from "node:path";
+import { dirname, isAbsolute, join, normalize, relative } from "node:path";
 import { homedir } from "node:os";
 import type { CommandCategory, CommandRule, OwnershipLevel, PolicyFile, PolicyIssue } from "./types.ts";
 import { canonicalPath, globToRegExp, isWithin, resolvePath } from "./path-utils.ts";
@@ -60,6 +60,10 @@ function parseOwnershipPattern(entry: string): { pattern: string; included: bool
   return { pattern: value, included: true };
 }
 
+export interface ProcessIoRoots {
+  deviceRoot: string;
+  processFdRoot: string;
+}
 export class PolicyStore {
   readonly home: string;
   readonly globalPath: string;
@@ -71,11 +75,22 @@ export class PolicyStore {
   private transientSession = new Set<string>();
   private trustLocal = true;
   private readonly systemReadonlyRoots: string[];
+  private readonly processIoRoots: ProcessIoRoots;
   private gitTrackedPaths = new Set<string>();
 
-  constructor(extensionDir: string, cwd: string, home = homedir(), systemReadonlyRoots = ["/nix/store"]) {
+  constructor(
+    extensionDir: string,
+    cwd: string,
+    home = homedir(),
+    systemReadonlyRoots = ["/nix/store"],
+    processIoRoots: ProcessIoRoots = { deviceRoot: "/dev", processFdRoot: "/proc/self/fd" },
+  ) {
     this.home = home;
     this.systemReadonlyRoots = systemReadonlyRoots.map(canonicalPath);
+    this.processIoRoots = {
+      deviceRoot: normalize(processIoRoots.deviceRoot),
+      processFdRoot: normalize(processIoRoots.processFdRoot),
+    };
     this.globalPath = join(extensionDir, "policy.json");
     this.cwd = canonicalPath(cwd);
     this.localPath = join(this.cwd, ".pi", "bash-guard.json");
@@ -138,6 +153,14 @@ export class PolicyStore {
   isSystemReadonlyPath(path: string): boolean {
     const canonical = canonicalPath(path);
     return this.systemReadonlyRoots.some((root) => isWithin(canonical, root));
+  }
+
+  isSafeProcessIoPath(path: string): boolean {
+    const lexical = normalize(path);
+    const deviceRelative = relative(this.processIoRoots.deviceRoot, lexical);
+    if (["null", "full", "zero", "stdin", "stdout", "stderr", "tty"].includes(deviceRelative)) return true;
+    if (/^fd[/\\][012]$/.test(deviceRelative)) return true;
+    return /^[012]$/.test(relative(this.processIoRoots.processFdRoot, lexical));
   }
 
   addCreated(path: string): void {

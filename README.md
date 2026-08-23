@@ -14,6 +14,7 @@ A local Pi extension that combines shell hazard detection with explicit path own
 - Wrappers such as `timeout` inherit the classification of the command they run.
 - Headless sessions block anything that would ask.
 - Reads and execution under `/nix/store` bypass ownership prompts; attempted mutation is denied.
+- Standard process I/O endpoints such as `/dev/null`, standard streams, and file descriptors 0–2 bypass ownership checks when used for I/O.
 - Desktop notifications announce permission prompts and when the agent becomes idle.
 
 ## Policies
