@@ -93,6 +93,36 @@ test("compound shell commands are separated in lexical permission order", () => 
   } finally { f.cleanup(); }
 });
 
+test("continued loop data is not treated as executable and curl GET remains read-only", () => {
+  const f = fixture();
+  try {
+    const sink = join(f.processDevice, "null");
+    const command = [
+      "set -eu",
+      "base=http://127.0.0.1:39000",
+      "curl -fsS \"$base/resource/index\" | rg -n 'asset|config' | head",
+      "for p in \\",
+      "  /resource/a.css \\",
+      "  /resource/a.js \\",
+      "  /resource/plugin.js; do",
+      `  code=$(curl -sS -o ${sink} -w '%{http_code}' "$base$p")`,
+      "  printf '%s %s\\n' \"$code\" \"$p\"",
+      "done",
+    ].join("\n");
+    const units = f.analyzer.analyzeCommandUnits(command, f.workspace);
+    assert.deepEqual(units.filter((unit) => unit.analysis.decision !== "allow"), []);
+    const header = units.find((unit) => unit.command.startsWith("for p in"))!;
+    assert.deepEqual(header.analysis.accesses, []);
+
+    assert.equal(f.analyzer.analyzeCommand("curl -X POST http://127.0.0.1/resource", f.workspace).decision, "ask");
+    const existingOutput = join(f.workspace, "response.txt");
+    writeFileSync(existingOutput, "old");
+    const output = f.analyzer.analyzeCommand(`curl -o ${existingOutput} http://127.0.0.1/resource`, f.workspace);
+    assert.equal(output.decision, "ask");
+    assert.deepEqual(output.ownershipCandidates, [{ path: existingOutput, required: "edit" }]);
+  } finally { f.cleanup(); }
+});
+
 test("network diagnostics keep fd redirections attached and remain non-mutative", () => {
   const f = fixture();
   try {
@@ -132,21 +162,21 @@ test("new creation is allowed and an existing unowned edit asks", () => {
 test("copy analysis expands prior assignments and checks concrete destination files", () => {
   const f = fixture();
   try {
-    const source = join(f.systemReadonly, "katex");
-    const destination = join(f.workspace, "assets", "katex");
-    mkdirSync(join(source, "contrib"), { recursive: true });
+    const source = join(f.systemReadonly, "package-assets");
+    const destination = join(f.workspace, "generated-assets");
+    mkdirSync(join(source, "plugins"), { recursive: true });
     mkdirSync(join(source, "fonts"));
-    writeFileSync(join(source, "katex.min.js"), "js");
-    writeFileSync(join(source, "katex.min.css"), "css");
-    writeFileSync(join(source, "contrib", "auto-render.min.js"), "auto");
+    writeFileSync(join(source, "app.min.js"), "js");
+    writeFileSync(join(source, "app.min.css"), "css");
+    writeFileSync(join(source, "plugins", "plugin.min.js"), "plugin");
     writeFileSync(join(source, "fonts", "font.woff2"), "font");
     const command = [
       "set -eu",
       `src=${source}`,
       `dst=${destination}`,
-      'mkdir -p "$dst/contrib"',
-      'cp "$src/katex.min.js" "$src/katex.min.css" "$dst/"',
-      'cp "$src/contrib/auto-render.min.js" "$dst/contrib/"',
+      'mkdir -p "$dst/plugins"',
+      'cp "$src/app.min.js" "$src/app.min.css" "$dst/"',
+      'cp "$src/plugins/plugin.min.js" "$dst/plugins/"',
       'cp -R "$src/fonts" "$dst/"',
       'find "$dst" -type f | wc -l',
     ].join("\n");
@@ -155,21 +185,21 @@ test("copy analysis expands prior assignments and checks concrete destination fi
     const copyCreations = units.filter((unit) => unit.command.startsWith("cp "))
       .flatMap((unit) => unit.analysis.creationCandidates);
     assert.deepEqual(copyCreations, [
-      join(destination, "katex.min.js"),
-      join(destination, "katex.min.css"),
-      join(destination, "contrib", "auto-render.min.js"),
+      join(destination, "app.min.js"),
+      join(destination, "app.min.css"),
+      join(destination, "plugins", "plugin.min.js"),
       join(destination, "fonts"),
       join(destination, "fonts", "font.woff2"),
     ]);
     assert.equal(copyCreations.includes(destination), false);
 
-    mkdirSync(join(destination, "contrib"), { recursive: true });
-    const existingTarget = join(destination, "contrib", "auto-render.min.js");
+    mkdirSync(join(destination, "plugins"), { recursive: true });
+    const existingTarget = join(destination, "plugins", "plugin.min.js");
     writeFileSync(existingTarget, "old");
     const overwrite = f.analyzer.analyzeCommandUnits([
       `src=${source}`,
       `dst=${destination}`,
-      'cp "$src/contrib/auto-render.min.js" "$dst/contrib/"',
+      'cp "$src/plugins/plugin.min.js" "$dst/plugins/"',
     ].join("\n"), f.workspace).at(-1)!.analysis;
     assert.equal(overwrite.decision, "ask");
     assert.deepEqual(overwrite.ownershipCandidates, [{ path: existingTarget, required: "edit" }]);

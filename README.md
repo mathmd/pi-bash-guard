@@ -10,7 +10,7 @@ A local Pi extension that combines shell hazard detection with explicit path own
 - Git-tracked regular files automatically receive edit ownership, including tracked files currently deleted from the worktree.
 - Edit ownership permits modification/deletion; full ownership additionally permits execution.
 - Secret reads, catastrophic commands, direct `.git` writes, and irreversible unowned deletion are denied.
-- Remote mutations and mutative Git/systemd commands always ask; filesystem searches, systemd inspection, common network diagnostics, and read-only IPP attribute queries do not.
+- Remote mutations and mutative Git/systemd commands always ask; filesystem searches, systemd inspection, HTTP GET/HEAD requests, common network diagnostics, and read-only IPP attribute queries do not.
 - Wrappers such as `timeout` inherit the classification of the command they run.
 - Persistent shell assignments are resolved across compound commands; copy operations check concrete destination files rather than requiring ownership of the destination directory.
 - Headless sessions block anything that would ask.

@@ -112,6 +112,43 @@ function isReadOnlySystemctl(args: string[]): boolean {
   return SYSTEMCTL_READ_SUBCOMMANDS.has(subcommand);
 }
 
+interface CurlClassification {
+  readOnly: boolean;
+  outputs: string[];
+}
+
+function classifyCurl(args: string[]): CurlClassification {
+  let method: string | undefined;
+  let queryMode = false;
+  let hasData = false;
+  let mutativePayload = false;
+  let opaqueConfig = false;
+  const outputs: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!;
+    if (arg === "-G" || arg === "--get") queryMode = true;
+    else if (arg === "-X" || arg === "--request") method = args[++index]?.toUpperCase();
+    else if (arg.startsWith("--request=")) method = arg.slice("--request=".length).toUpperCase();
+    else if (["-d", "--data", "--data-ascii", "--data-binary", "--data-raw", "--data-urlencode", "--json"].includes(arg)) {
+      hasData = true; index++;
+    } else if (/^-d.+/.test(arg) || /^--(?:data(?:-ascii|-binary|-raw|-urlencode)?|json)=/.test(arg)) hasData = true;
+    else if (["-F", "--form", "--form-string", "-T", "--upload-file"].includes(arg)) {
+      mutativePayload = true; index++;
+    } else if (/^-F.+/.test(arg) || /^--(?:form|form-string|upload-file)=/.test(arg)) mutativePayload = true;
+    else if (arg === "-K" || arg === "--config" || arg.startsWith("--config=")) {
+      opaqueConfig = true;
+      if (!arg.includes("=")) index++;
+    } else if (arg === "-o" || arg === "--output") {
+      const output = args[++index];
+      if (output) outputs.push(output);
+    } else if (arg.startsWith("--output=")) outputs.push(arg.slice("--output=".length));
+    else if (/^-o.+/.test(arg)) outputs.push(arg.slice(2));
+    else if (arg === "-O" || arg === "--remote-name" || arg === "--remote-header-name") opaqueConfig = true;
+  }
+  const safeMethod = !method || ["GET", "HEAD", "OPTIONS"].includes(method);
+  return { readOnly: safeMethod && !mutativePayload && !opaqueConfig && (!hasData || queryMode), outputs };
+}
+
 const CATASTROPHIC: Array<[RegExp, string]> = [
   [/\b(?:mkfs(?:\.\w+)?|newfs_\w+|wipefs)\b/, "filesystem formatting or signature destruction"],
   [/\bdd\b[^\n]*\bof=\/dev\//, "raw device write"],
@@ -279,7 +316,8 @@ export class GuardAnalyzer {
 
     let tokens: ParseToken[];
     try {
-      tokens = shellParse(command.replace(/\n/g, " ; "), shellEnvironmentResolver(shellEnvironment, this.policy.home)) as ParseToken[];
+      const normalizedCommand = command.replace(/\\\r?\n/g, " ").replace(/\n/g, " ; ");
+      tokens = shellParse(normalizedCommand, shellEnvironmentResolver(shellEnvironment, this.policy.home)) as ParseToken[];
     }
     catch { return this.result("ask", ["Shell syntax could not be analyzed safely"]); }
 
@@ -376,6 +414,23 @@ export class GuardAnalyzer {
               accesses.push({ path: candidate, kind: "read", source: "git", literal: true, existed: pathExists(candidate) });
             }
           }
+        }
+        continue;
+      }
+
+      if (cmd === "curl") {
+        const classification = classifyCurl(args);
+        if (!classification.readOnly) {
+          baseDecision = strongest(baseDecision, "ask");
+          reasons.push("curl request may mutate remote state or uses opaque output options");
+        }
+        for (const output of classification.outputs) {
+          if (output === "-") continue;
+          const lexicalOutput = resolvePath(output, cwd, this.policy.home);
+          if (this.policy.isSafeProcessIoPath(lexicalOutput)) continue;
+          const path = this.path(output, cwd);
+          if (pathExists(path)) accesses.push({ path, kind: "edit", source: "curl output", literal: true, existed: true });
+          else creations.push(path);
         }
         continue;
       }
