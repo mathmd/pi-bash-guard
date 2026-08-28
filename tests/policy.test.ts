@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -128,5 +128,26 @@ test("Git-tracked files receive automatic edit ownership", () => {
     rmSync(tracked);
     f.policy.refreshGitOwnership();
     assert.equal(f.policy.ownership(tracked), "edit");
+  } finally { f.cleanup(); }
+});
+
+test("Git ownership discovery follows repository ancestors and cwd symlinks", () => {
+  const f = fixture();
+  try {
+    const nested = join(f.workspace, "packages", "app");
+    const tracked = join(nested, "tracked.txt");
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(tracked, "tracked\n");
+    assert.equal(spawnSync("git", ["-C", f.workspace, "init", "--quiet"]).status, 0);
+    assert.equal(spawnSync("git", ["-C", f.workspace, "add", "--", tracked]).status, 0);
+
+    const nestedPolicy = new PolicyStore(f.extension, nested, f.home);
+    assert.equal(nestedPolicy.ownership(tracked), "edit");
+
+    const linkedCwd = join(f.root, "linked-workdir");
+    symlinkSync(nested, linkedCwd, "dir");
+    const linkedPolicy = new PolicyStore(f.extension, linkedCwd, f.home);
+    assert.equal(linkedPolicy.ownership(join(linkedCwd, "tracked.txt")), "edit");
+    assert.equal(linkedPolicy.getLocalPath(), join(nested, ".pi", "bash-guard.json"));
   } finally { f.cleanup(); }
 });
