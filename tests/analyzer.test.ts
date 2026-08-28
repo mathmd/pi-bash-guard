@@ -373,6 +373,27 @@ test("systemctl inspection and timeout wrappers preserve read-only classificatio
   } finally { f.cleanup(); }
 });
 
+test("embedded command strings are not inferred as paths", () => {
+  const f = fixture();
+  try {
+    const generic = f.analyzer.analyzeCommand(`unknown-tool 'inspect("nested/example.so")'`, f.workspace);
+    assert.equal(generic.decision, "ask");
+    assert.deepEqual(generic.ownershipCandidates, []);
+    assert.doesNotMatch(generic.reasons.join(" "), /Modification requires/);
+
+    const embeddedCode = [
+      "nvim --headless",
+      `'+lua print(vim.inspect(vim.api.nvim_get_runtime_file("parser/example.so", true)))'`,
+      "+qa",
+    ].join(" ");
+    const result = f.analyzer.analyzeCommand(embeddedCode, f.workspace);
+    assert.equal(result.decision, "ask");
+    assert.deepEqual(result.accesses, []);
+    assert.deepEqual(result.ownershipCandidates, []);
+    assert.deepEqual(result.reasons, ["Unknown command nvim requires approval"]);
+  } finally { f.cleanup(); }
+});
+
 test("creating a new policy or .git file is not silently allowed", () => {
   const f = fixture();
   try {

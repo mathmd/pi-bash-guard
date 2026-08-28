@@ -56,9 +56,12 @@ export function containsGitMetadata(path: string): boolean {
 }
 
 export function looksLikePath(value: string): boolean {
-  if (!value || value.startsWith("-") || value.includes("\n")) return false;
-  return value === "." || value === ".." || value.startsWith("./") || value.startsWith("../") ||
-    value.startsWith("/") || value.startsWith("~/") || value.includes("/");
+  if (!value || value.startsWith("-") || value.includes("\n") || /^(?:[A-Za-z][A-Za-z0-9+.-]*):\/\//.test(value)) return false;
+  if (value === "." || value === ".." || value.startsWith("./") || value.startsWith("../") ||
+      value.startsWith("/") || value.startsWith("~/") || /^[A-Za-z]:[\\/]/.test(value)) return true;
+  if (/\s/.test(value)) return false;
+  const segment = "[A-Za-z0-9._@%+=,:~-]+";
+  return new RegExp(`^${segment}(?:/${segment})+/?$`).test(value);
 }
 
 export function globToRegExp(pattern: string): RegExp {
