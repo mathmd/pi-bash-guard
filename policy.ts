@@ -16,8 +16,9 @@ const DEFAULT_SECRET_PATTERNS = [
 export type PolicyScope = "global" | "local";
 interface LoadedPolicy { file: PolicyFile; path: string; base: string; scope: PolicyScope; }
 
+type PolicyInput = Omit<PolicyFile, "tools"> & { tools?: PolicyFile["tools"] };
 export function emptyPolicy(): PolicyFile {
-  return { version: 2, ownership: { edit: [], full: [] }, secrets: [], commands: [] };
+  return { version: 2, ownership: { edit: [], full: [] }, secrets: [], commands: [], tools: { read: [] } };
 }
 
 function validateStrings(value: unknown, field: string): string[] {
@@ -49,7 +50,10 @@ function validatePolicy(value: unknown): PolicyFile {
     }
     return { name: rule.name, category: rule.category as CommandCategory, ...(typeof rule.note === "string" ? { note: rule.note } : {}) };
   });
-  return { version: 2, ownership: { edit, full }, secrets, commands };
+  const rawTools = obj.tools ?? {};
+  if (!rawTools || typeof rawTools !== "object" || Array.isArray(rawTools)) throw new Error("tools must contain a read list");
+  const readTools = validateStrings((rawTools as Record<string, unknown>).read ?? [], "tools.read");
+  return { version: 2, ownership: { edit, full }, secrets, commands, tools: { read: readTools } };
 }
 
 function parseOwnershipPattern(entry: string): { pattern: string; included: boolean } | undefined {
@@ -233,6 +237,10 @@ export class PolicyStore {
     return this.policies.flatMap((policy) => policy.file.commands).findLast((rule) => rule.name === name)?.category;
   }
 
+  isReadOnlyTool(name: string): boolean {
+    return this.policies.some((policy) => policy.file.tools.read.includes(name));
+  }
+
   private write(scope: PolicyScope, file: PolicyFile): { path: string; content: string } {
     const path = this.getPolicyPath(scope);
     const content = `${JSON.stringify(validatePolicy(file), null, 2)}\n`;
@@ -244,8 +252,8 @@ export class PolicyStore {
     return { path, content };
   }
 
-  save(scope: PolicyScope, file: PolicyFile): void {
-    this.write(scope, file);
+  save(scope: PolicyScope, file: PolicyInput): void {
+    this.write(scope, validatePolicy(file));
   }
 
   ensurePolicy(scope: PolicyScope): string {
@@ -261,6 +269,17 @@ export class PolicyStore {
     current.ownership[level].push(pattern);
     const written = this.write(scope, current);
     const quoted = JSON.stringify(pattern);
+    const lines = written.content.split("\n");
+    const line = lines.findLastIndex((value) => value.includes(quoted)) + 1;
+    return { path: written.path, line: Math.max(1, line) };
+  }
+
+  appendReadOnlyTool(scope: PolicyScope, name: string): { path: string; line: number } {
+    const policyPath = this.ensurePolicy(scope);
+    const current = validatePolicy(JSON.parse(readFileSync(policyPath, "utf8")));
+    if (!current.tools.read.includes(name)) current.tools.read.push(name);
+    const written = this.write(scope, current);
+    const quoted = JSON.stringify(name);
     const lines = written.content.split("\n");
     const line = lines.findLastIndex((value) => value.includes(quoted)) + 1;
     return { path: written.path, line: Math.max(1, line) };

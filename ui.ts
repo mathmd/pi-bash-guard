@@ -134,6 +134,28 @@ async function grantOwnership(
   return ownershipSatisfies(policy.ownership(candidate.path), candidate.required);
 }
 
+async function trustReadOnlyTool(
+  ctx: ExtensionContext,
+  policy: PolicyStore,
+  name: string,
+): Promise<boolean> {
+  const scope = await chooseScope(ctx, true);
+  if (!scope) return false;
+  let target: { path: string; line: number };
+  try {
+    target = policy.appendReadOnlyTool(scope, name);
+  } catch (error) {
+    const path = policy.getPolicyPath(scope);
+    ctx.ui.notify(`Could not add the tool: ${String(error)}. Edit the policy manually.`, "warning");
+    await openPolicyInEditor(ctx, path, 1);
+    policy.reload();
+    return policy.isReadOnlyTool(name);
+  }
+  await openPolicyInEditor(ctx, target.path, target.line);
+  policy.reload();
+  return policy.isReadOnlyTool(name);
+}
+
 async function refuseWithOptionalComment(ctx: ExtensionContext): Promise<PromptDecision> {
   const choice = await menu(ctx, "Command refused. Would you like to attach a comment?", ["Refuse without comment", "Add comment…"], false);
   if (choice !== "Add comment…") return { action: "refuse" };
@@ -146,6 +168,7 @@ async function promptFlow(
   policy: PolicyStore,
   analysis: Analysis,
   subject: string,
+  readOnlyTool?: string,
 ): Promise<PromptDecision> {
   if (!ctx.hasUI) return { action: "refuse", context: "No interactive UI is available" };
   if (analysis.decision === "deny") {
@@ -158,10 +181,16 @@ async function promptFlow(
   while (true) {
     const choices = ["Allow once", "Refuse"];
     if (candidate) choices.push(`Grant ${candidate.required} ownership…`);
+    const trustLabel = readOnlyTool ? `Trust ${readOnlyTool} as read-only…` : undefined;
+    if (trustLabel) choices.push(trustLabel);
     const choice = await menu(ctx, summary(analysis, subject), choices, false);
     if (choice === "Allow once") return { action: "allow" };
     if (candidate && choice === `Grant ${candidate.required} ownership…`) {
       if (await grantOwnership(ctx, policy, candidate)) return { action: "allow" };
+      continue;
+    }
+    if (trustLabel && readOnlyTool && choice === trustLabel) {
+      if (await trustReadOnlyTool(ctx, policy, readOnlyTool)) return { action: "allow" };
       continue;
     }
     if (choice === "Refuse") return refuseWithOptionalComment(ctx);
@@ -173,9 +202,10 @@ export async function promptForDecision(
   policy: PolicyStore,
   analysis: Analysis,
   subject: string,
+  readOnlyTool?: string,
 ): Promise<PromptDecision> {
   try {
-    return await promptFlow(ctx, policy, analysis, subject);
+    return await promptFlow(ctx, policy, analysis, subject, readOnlyTool);
   } catch (error) {
     if (error instanceof MenuCancelled) return { action: "refuse" };
     throw error;

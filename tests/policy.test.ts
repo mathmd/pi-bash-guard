@@ -84,6 +84,27 @@ test("ownership append writes the exact path and reports its editor line", () =>
   } finally { f.cleanup(); }
 });
 
+test("read-only tool lists combine and append at an editor-targetable line", () => {
+  const f = fixture();
+  try {
+    f.policy.save("global", {
+      version: 2,
+      ownership: { edit: [], full: [] },
+      secrets: [],
+      commands: [],
+      tools: { read: ["anchor_grep"] },
+    });
+    f.policy.save("local", { version: 2, ownership: { edit: [], full: [] }, secrets: [], commands: [] });
+    assert.equal(f.policy.isReadOnlyTool("anchor_grep"), true);
+    assert.equal(f.policy.isReadOnlyTool("unknown_tool"), false);
+
+    const result = f.policy.appendReadOnlyTool("local", "source_check");
+    const lines = readFileSync(result.path, "utf8").split("\n");
+    assert.equal(lines[result.line - 1]?.includes(JSON.stringify("source_check")), true);
+    assert.equal(f.policy.isReadOnlyTool("source_check"), true);
+  } finally { f.cleanup(); }
+});
+
 test("version 1 policy is rejected without migration or rewrite", () => {
   const f = fixture();
   try {

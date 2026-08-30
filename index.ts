@@ -5,33 +5,16 @@ import { quote as shellQuote } from "shell-quote";
 import type { ExtensionAPI, ToolCallEvent, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { GuardAnalyzer } from "./analyzer.ts";
-import { canonicalPath, containsGitMetadata, looksLikePath, pathExists, resolvePath } from "./path-utils.ts";
+import { canonicalPath, containsGitMetadata, pathExists, resolvePath } from "./path-utils.ts";
 import { PolicyStore } from "./policy.ts";
-import type { AccessKind, Analysis } from "./types.ts";
+import type { Analysis } from "./types.ts";
 import { strongest } from "./types.ts";
 import { openPolicyManager, promptForDecision } from "./ui.ts";
 import { sendSystemNotification } from "./notifications.ts";
+import { genericPathInputs } from "./tool-paths.ts";
 
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
-const PATH_KEYS = /(?:^|_)(?:path|file|filename|directory|dir|cwd|root|target|destination|dest|output)(?:$|_)/i;
-const READ_KEYS = /(?:source|input|read|search|root|cwd)/i;
-
 interface PendingCreation { paths: string[]; reloadPolicy: boolean; }
-
-function genericPathInputs(input: unknown, key = "", out: Array<{ value: string; kind: AccessKind }> = []): Array<{ value: string; kind: AccessKind }> {
-  if (typeof input === "string") {
-    if (PATH_KEYS.test(key) && looksLikePath(input)) out.push({ value: input, kind: READ_KEYS.test(key) ? "read" : "unknown" });
-    return out;
-  }
-  if (Array.isArray(input)) {
-    for (const value of input) genericPathInputs(value, key, out);
-    return out;
-  }
-  if (input && typeof input === "object") {
-    for (const [childKey, value] of Object.entries(input as Record<string, unknown>)) genericPathInputs(value, childKey, out);
-  }
-  return out;
-}
 
 function mergeAnalyses(items: Analysis[]): Analysis {
   return items.reduce<Analysis>((result, item) => ({
@@ -61,7 +44,7 @@ function analyzeTool(event: ToolCallEvent, cwd: string, analyzer: GuardAnalyzer,
   if (isToolCallEventType("grep", event) || isToolCallEventType("find", event) || isToolCallEventType("ls", event)) {
     return analyzer.analyzePathAccess(event.input.path ?? ".", "read", cwd, event.toolName);
   }
-  const paths = genericPathInputs(event.input);
+  const paths = genericPathInputs(event.input, "", [], policy.isReadOnlyTool(event.toolName) ? "read" : undefined);
   if (!paths.length) return { decision: "allow", reasons: [], accesses: [], creationCandidates: [], trashablePaths: [], ownershipCandidates: [] };
   return mergeAnalyses(paths.map((item) => analyzer.analyzePathAccess(item.value, item.kind, cwd, event.toolName)));
 }
@@ -143,7 +126,11 @@ export default function bashGuard(pi: ExtensionAPI): void {
       if (ctx.mode === "tui" && ctx.hasUI) {
         sendSystemNotification("Pi requires permission", `${item.subject}\n${promptAnalysis.reasons.join("\n")}`);
       }
-      const response = await promptForDecision(ctx, policy!, promptAnalysis, item.subject);
+      const readOnlyTool = !isToolCallEventType("bash", event) &&
+        itemAnalysis.accesses.some((access) => access.kind === "unknown" && access.source === event.toolName)
+        ? event.toolName
+        : undefined;
+      const response = await promptForDecision(ctx, policy!, promptAnalysis, item.subject, readOnlyTool);
       if (response.action === "allow") continue;
       if (response.action === "trash" && isToolCallEventType("bash", event) && itemAnalysis.trashablePaths.length && promptItems.length === 1) {
         // Replace, rather than execute inside the hook, so Pi records the actual reversible operation.

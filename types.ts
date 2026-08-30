@@ -19,6 +19,7 @@ export interface PolicyFile {
   ownership: OwnershipPatterns;
   secrets: string[];
   commands: CommandRule[];
+  tools: { read: string[] };
 }
 
 export interface PathAccess {
