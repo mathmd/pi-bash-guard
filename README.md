@@ -4,17 +4,18 @@ A local Pi extension that combines shell hazard detection with explicit path own
 
 ## Decisions
 
-- Unowned paths are readable unless secret; modifying or executing them asks once.
+- Existing unowned paths are readable unless secret; modifying or executing them asks once. Known-missing literal paths do not require ownership, while protected policy, secret, `.git`, and system locations retain their safety rules.
 - Pi-created paths receive edit ownership until the agent becomes idle.
 - Pi-created paths under `/tmp` retain edit ownership for the Pi session.
 - Git-tracked regular files automatically receive edit ownership when the working directory is the repository root, any nested subdirectory, or a symlink resolving into either; tracked files currently deleted from the worktree are included.
 - Edit ownership permits modification/deletion, execute ownership permits execution without editing, and full ownership combines both capabilities.
 - Secret reads, catastrophic commands, direct `.git` writes, and irreversible unowned deletion are denied.
-- Remote mutations and mutative Git/systemd commands always ask; filesystem searches, systemd inspection, HTTP GET/HEAD requests, common network diagnostics, and read-only IPP attribute queries do not.
+- Remote mutations and mutative Git/systemd commands always ask; filesystem searches, systemd inspection, documented `nix-store` queries, conservative modern Nix inspection commands, Hyprland information commands, HTTP GET/HEAD requests, common network diagnostics, and read-only IPP attribute queries do not.
 - Wrappers such as `timeout` inherit the classification of the command they run.
 - Shell `command -v`/`command -V` inspection is non-executing and does not treat the queried name as a command; other `command` forms still inherit the wrapped command’s classification.
 - Shell interpreter `-c` source is analyzed recursively as shell; inline JavaScript, Python, Ruby, Perl, Deno, and Bun source is treated as opaque code requiring approval rather than misparsed as shell.
-- Persistent shell assignments are resolved across compound commands; copy operations check concrete destination files rather than requiring ownership of the destination directory.
+- Command substitutions (`$(…)` and backticks) are analyzed recursively, while their resulting text is treated as data in the surrounding command rather than as additional shell syntax.
+- Persistent shell assignments are resolved across compound commands and their static values are shown in relevant permission details; copy operations check concrete destination files rather than requiring ownership of the destination directory.
 - Command-position variables from literal assignments and literal `for … in …` lists are resolved statically and prompted per executable candidate; dynamic values remain unresolved and are labeled explicitly.
 - Path inference recognizes whole path arguments, not slash-containing code snippets, command strings, URLs, or other embedded text.
 - Headless sessions block anything that would ask.

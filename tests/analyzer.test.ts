@@ -390,6 +390,68 @@ test("systemctl inspection and timeout wrappers preserve read-only classificatio
   } finally { f.cleanup(); }
 });
 
+test("Nix store queries and Hyprland inspection commands are read-only", () => {
+  const f = fixture();
+  try {
+    const storePath = join(f.systemReadonly, "example-package");
+    const derivation = `${storePath}.drv`;
+    writeFileSync(storePath, "output\n");
+    writeFileSync(derivation, "derivation\n");
+    for (const command of [
+      `nix-store -q --deriver ${storePath}`,
+      `nix-store --query --references ${storePath}`,
+      `nix derivation show ${derivation}`,
+      `nix path-info --json ${storePath}`,
+      "nix --version",
+      "nix-store --help",
+      "hyprctl binds",
+      "hyprctl -j clients",
+      "hyprctl instances -j",
+      "hyprctl configerrors",
+      "hyprctl --help",
+    ]) assert.equal(f.analyzer.analyzeCommand(command, f.workspace).decision, "allow", command);
+    const assignedQuery = f.analyzer.analyzeCommandUnits(`store=${storePath}; nix-store -q --deriver "$store"`, f.workspace);
+    assert.equal(assignedQuery.every((unit) => unit.analysis.decision === "allow"), true);
+    assert.deepEqual(assignedQuery.at(-1)?.resolvedBindings, [{ name: "store", value: storePath }]);
+    assert.equal(f.analyzer.analyzeCommand(`nix-store -q --force-realise ${storePath}`, f.workspace).decision, "ask");
+    assert.equal(f.analyzer.analyzeCommand(`nix build ${storePath}`, f.workspace).decision, "ask");
+    assert.equal(f.analyzer.analyzeCommand("nix run .#tool -- --help", f.workspace).decision, "ask");
+    assert.equal(f.analyzer.analyzeCommand("hyprctl dispatch closewindow active", f.workspace).decision, "ask");
+    assert.equal(f.analyzer.analyzeCommand("hyprctl dispatch exec --help", f.workspace).decision, "ask");
+    assert.equal(f.analyzer.analyzeCommand("hyprctl --batch 'dispatch workspace 1'", f.workspace).decision, "ask");
+  } finally { f.cleanup(); }
+});
+
+test("command substitutions execute without turning assignment suffixes into commands", () => {
+  const f = fixture();
+  try {
+    const command = "log=${XDG_RUNTIME_DIR:-/run/user/$UID}/hypr/$(hyprctl instances -j | jq -r '.instance')/hyprland.log";
+    const result = f.analyzer.analyzeCommand(command, f.workspace);
+    assert.equal(result.decision, "allow");
+    assert.deepEqual(result.ownershipCandidates, []);
+    assert.equal(result.accesses.some((access) => access.path.endsWith("/hyprland.log")), false);
+
+    const nested = f.analyzer.analyzeCommand("value=$(unknown-inspector --flag)/suffix.txt", f.workspace);
+    assert.equal(nested.decision, "ask");
+    assert.deepEqual(nested.reasons, ["Unknown command unknown-inspector requires approval"]);
+    assert.deepEqual(nested.ownershipCandidates, []);
+    assert.equal(f.analyzer.analyzeCommand("printf '%s' '$(unknown-inspector)'", f.workspace).decision, "allow");
+    assert.match(f.analyzer.analyzeCommand("value=`unknown-inspector --flag`", f.workspace).reasons.join(" "), /Unknown command unknown-inspector/);
+  } finally { f.cleanup(); }
+});
+
+test("known-missing literal paths do not require ownership", () => {
+  const f = fixture();
+  try {
+    const missing = join(f.workspace, "does-not-exist.sh");
+    const result = f.analyzer.analyzeCommand(missing, f.workspace);
+    assert.equal(result.decision, "allow");
+    assert.deepEqual(result.ownershipCandidates, []);
+    assert.equal(result.accesses[0]?.existed, false);
+    assert.equal(f.analyzer.analyzeCommand(`cat ${join(f.workspace, ".env")}`, f.workspace).decision, "deny");
+  } finally { f.cleanup(); }
+});
+
 test("embedded command strings are not inferred as paths", () => {
   const f = fixture();
   try {
@@ -464,6 +526,11 @@ test("literal executable variables are analyzed and surfaced per candidate", () 
     const assigned = f.analyzer.analyzeCommandUnits(`c=assigned-tool; "$c"`, f.workspace)
       .filter((unit) => unit.analysis.decision !== "allow");
     assert.deepEqual(assigned[0]?.executableBindings, [{ name: "c", value: "assigned-tool" }]);
+
+    const store = join(f.systemReadonly, "assigned-store-path");
+    const resolved = f.analyzer.analyzeCommandUnits(`store=${store}; nix build "$store"`, f.workspace)
+      .filter((unit) => unit.analysis.decision !== "allow");
+    assert.deepEqual(resolved[0]?.resolvedBindings, [{ name: "store", value: store }]);
 
     const dynamic = f.analyzer.analyzeCommandUnits(`"$runtime_tool" --version`, f.workspace)
       .filter((unit) => unit.analysis.decision !== "allow");
@@ -553,6 +620,10 @@ test("trusted command patterns override unknown fallback only when arguments mat
     const guardedPath = f.analyzer.analyzeCommand(`inspect-local --json ${pathArgument}`, f.workspace);
     assert.equal(guardedPath.decision, "ask");
     assert.deepEqual(guardedPath.ownershipCandidates, [{ path: pathArgument, required: "edit" }]);
+    const missingArgument = join(f.workspace, "missing-input.txt");
+    const missingPath = f.analyzer.analyzeCommand(`inspect-local --json ${missingArgument}`, f.workspace);
+    assert.equal(missingPath.decision, "allow");
+    assert.deepEqual(missingPath.ownershipCandidates, []);
     f.policy.addCreated(pathArgument);
     assert.equal(f.analyzer.analyzeCommand(`inspect-local ${pathArgument} --json`, f.workspace).decision, "allow");
     assert.equal(f.analyzer.analyzeCommand(`inspect-local --json ${join(f.workspace, ".env")}`, f.workspace).decision, "deny");

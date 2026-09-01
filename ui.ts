@@ -1,4 +1,5 @@
 import type { ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { CommandAnalysisUnit } from "./analyzer.ts";
 import type { Analysis, OwnershipLevel } from "./types.ts";
 import type { PolicyScope, PolicyStore } from "./policy.ts";
 import { openPolicyInEditor } from "./external-editor.ts";
@@ -10,6 +11,21 @@ class PermissionTimedOut extends Error {}
 function summary(analysis: Analysis, subject: string): string {
   const reasons = analysis.reasons.map((reason) => `• ${reason}`).join("\n");
   return `${subject}\n\n${reasons}`;
+}
+
+export function shellBindingDetails(unit: CommandAnalysisUnit): string {
+  const sections: string[] = [];
+  const executableNames = new Set(unit.executableBindings?.map(({ name }) => name) ?? []);
+  if (unit.executableBindings?.length) {
+    const bindings = unit.executableBindings.map(({ name, value }) =>
+      `$${name} = ${value === undefined ? "<unresolved at analysis time>" : JSON.stringify(value)}`);
+    sections.push(`Executable variable${bindings.length === 1 ? "" : "s"}:\n${bindings.join("\n")}`);
+  }
+  const resolved = unit.resolvedBindings?.filter(({ name }) => !executableNames.has(name)) ?? [];
+  if (resolved.length) {
+    sections.push(`Resolved shell variable${resolved.length === 1 ? "" : "s"}:\n${resolved.map(({ name, value }) => `$${name} = ${JSON.stringify(value)}`).join("\n")}`);
+  }
+  return sections.length ? `\n\n${sections.join("\n\n")}` : "";
 }
 
 export function formatTimeout(timeoutMs: number): string {

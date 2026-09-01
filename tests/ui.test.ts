@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { editorInvocation } from "../external-editor.ts";
-import { detailViewport, formatTimeout, ownershipGrantLevels } from "../ui.ts";
+import { detailViewport, formatTimeout, ownershipGrantLevels, shellBindingDetails } from "../ui.ts";
 
 test("Neovim opens the policy at the newly appended entry", () => {
   const root = mkdtempSync(join(tmpdir(), "bash-guard-editor-"));
@@ -55,4 +55,15 @@ test("ownership prompts expose relevant capability grants and timeout labels", (
   );
   assert.equal(formatTimeout(90_000), "1m30s");
   assert.equal(formatTimeout(45_000), "45s");
+});
+
+test("permission details show statically resolved shell values", () => {
+  assert.equal(
+    shellBindingDetails({
+      command: "nix build $store",
+      analysis: { decision: "ask", reasons: [], accesses: [], creationCandidates: [], trashablePaths: [], ownershipCandidates: [] },
+      resolvedBindings: [{ name: "store", value: "/nix/store/example" }],
+    }),
+    '\n\nResolved shell variable:\n$store = "/nix/store/example"',
+  );
 });
