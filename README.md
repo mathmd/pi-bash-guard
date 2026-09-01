@@ -8,7 +8,7 @@ A local Pi extension that combines shell hazard detection with explicit path own
 - Pi-created paths receive edit ownership until the agent becomes idle.
 - Pi-created paths under `/tmp` retain edit ownership for the Pi session.
 - Git-tracked regular files automatically receive edit ownership when the working directory is the repository root, any nested subdirectory, or a symlink resolving into either; tracked files currently deleted from the worktree are included.
-- Edit ownership permits modification/deletion; full ownership additionally permits execution.
+- Edit ownership permits modification/deletion, execute ownership permits execution without editing, and full ownership combines both capabilities.
 - Secret reads, catastrophic commands, direct `.git` writes, and irreversible unowned deletion are denied.
 - Remote mutations and mutative Git/systemd commands always ask; filesystem searches, systemd inspection, HTTP GET/HEAD requests, common network diagnostics, and read-only IPP attribute queries do not.
 - Wrappers such as `timeout` inherit the classification of the command they run.
@@ -30,37 +30,40 @@ Project policy: `<project>/.pi/bash-guard.json` (loaded only for trusted project
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "ownership": {
-    "edit": [
-      "./generated/**",
-      "!./generated/protected/**"
-    ],
-    "full": [
-      "/absolute/trusted/scripts/**",
-      "!/absolute/trusted/scripts/untrusted/**"
-    ]
+    "edit": ["./generated/**", "!./generated/protected/**"],
+    "execute": ["./scripts/**", "!./scripts/untrusted/**"],
+    "full": ["/absolute/trusted/tools/**"]
   },
   "secrets": ["./private/**"],
-  "commands": [
-    { "name": "project-inspect", "category": "read", "note": "local inspection helper" },
-    { "name": "legacy-deploy", "category": "remote" }
-  ],
+  "commands": {
+    "include": [
+      ["project-inspect", "--json", "**"],
+      ["release-*", "--dry-run"]
+    ],
+    "exclude": [
+      ["project-inspect", "--write", "**"]
+    ]
+  },
   "tools": {
     "read": ["anchor_grep"]
-  }
+  },
+  "permissionTimeout": "1m30s"
 }
 ```
 
-Ownership lists use ordered Gitignore-style patterns. The last matching positive or `!` negative controls membership in that class. Full is evaluated first; an exclusion or miss falls through to edit, then to the read-only default. Global lists are evaluated before trusted local lists.
+Ownership lists use ordered Gitignore-style patterns. The last matching positive or `!` negative controls membership in each capability. Full is checked first; matching both edit and execute is also treated as full. Otherwise paths fall back to read-only. Global lists are evaluated before trusted local lists.
 
-Run `/bash-guard`, choose global or local, and the policy opens directly in `$VISUAL`, `$EDITOR`, or `nano`. There is no policy-management submenu. Custom command categories are edited in the same file: `allow`, `read`, `create`, `edit`, `delete`, `execute`, `remote`, and `deny`. Exact tool names in `tools.read` make recognizable path inputs read-only while retaining secret checks. Global and trusted local tool lists are combined.
+Command entries are unordered string lists. The first member is a glob for the command name; remaining members are argument globs matched one-to-one without regard to order. Without a final `**`, the argument multiset must match exactly. Final `**` permits unmatched arguments. Exclusions override inclusions by removing trust; they do not create deny rules. Backslash escapes literal `*`, `?`, or `\`. Matching entries suppress only the otherwise-unknown command decision: path-like arguments are still interpreted and enforced through secret, `.git`, and ownership rules, while built-in safety classifications and catastrophic screening retain precedence.
+
+Run `/bash-guard`, choose global or local, and the policy opens directly in `$VISUAL`, `$EDITOR`, or `nano`. Version 3 is required and older policies are not migrated automatically. Exact tool names in `tools.read` make recognizable path inputs read-only while retaining secret checks. `permissionTimeout` accepts `0`, `"45s"`, `"2m"`, or combined durations such as `"1m30s"`; trusted local settings override global settings.
 
 ## Approval choices
 
-A flagged operation offers one-time approval or refusal with an optional follow-up comment. Compound shell input is inspected in lexical shell order and each command requiring permission is presented separately. Choosing persistent ownership asks only for global or local scope, appends the exact path to the required edit/full list, and opens the policy in the external editor at that entry. Unknown tools with unclassified path inputs similarly offer a read-only trust option, append the exact tool name to `tools.read`, and open the editor at that entry. Literal standalone unowned deletion may be replaced with `gio trash`.
+A flagged operation offers one-time approval or refusal with an optional follow-up comment. Mutation prompts offer edit/full grants, execution prompts offer execute/full grants, and ambiguous path access offers edit/execute/full. Persistent choices append the exact path and open the policy at that entry. Unknown commands similarly offer an exact argument-aware trust entry, and unknown tools can be added to `tools.read`; both flows open the editor at the inserted line. Neovim receives `+<line>`. Literal standalone unowned deletion may be replaced with `gio trash`.
 
-Menus use `j`/`k` or arrow keys to move, `l` or Enter to accept, and `h` to go back one level. Long command/reason details keep the options visible; use Ctrl-U/Ctrl-D or `g`/`G` to inspect every detail page. Esc and Ctrl-C cancel the entire flow.
+Menus use `j`/`k` or arrow keys to move, `l` or Enter to accept, and `h` to go back one level. Long command/reason details keep the options visible; use Ctrl-U/Ctrl-D or `g`/`G` to inspect every detail page. Esc and Ctrl-C cancel the entire flow. A nonzero permission timeout automatically refuses each unanswered permission prompt when its timer expires.
 
 ## Limits
 

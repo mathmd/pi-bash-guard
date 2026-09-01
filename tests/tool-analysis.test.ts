@@ -31,10 +31,10 @@ test("configured read-only tools use read access while retaining secret checks",
     assert.equal(before.kind, "unknown");
     assert.equal(before.analysis.decision, "ask");
     policy.save("local", {
-      version: 2,
-      ownership: { edit: [], full: [] },
+      version: 3,
+      ownership: { edit: [], execute: [], full: [] },
       secrets: [],
-      commands: [],
+      commands: { include: [], exclude: [] },
       tools: { read: ["anchor_grep"] },
     });
     const after = analyze(workspace);

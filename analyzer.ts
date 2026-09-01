@@ -38,6 +38,12 @@ function parseGitInvocation(args: string[]): GitInvocation {
   return { subcommand: args[index] ?? "", args: args.slice(index + 1), informational };
 }
 
+function isDestructiveGitInvocation(invocation: GitInvocation): boolean {
+  return (invocation.subcommand === "push" && invocation.args.some((arg) => arg === "-f" || arg.startsWith("--force"))) ||
+    (invocation.subcommand === "reset" && invocation.args.includes("--hard")) ||
+    (invocation.subcommand === "clean" && invocation.args.some((arg) => /^-[A-Za-z]*f/.test(arg)));
+}
+
 function onlyOptions(args: string[], valueOptions: Set<string>): boolean {
   for (let index = 0; index < args.length; index++) {
     const arg = args[index]!;
@@ -301,7 +307,6 @@ function isStaticallyResolvedValue(value: string): boolean {
 }
 
 function hasOpaqueInlineCode(command: string, args: string[]): boolean {
-  if ((command === "deno" || command === "bun") && args.find((arg) => !arg.startsWith("-")) === "eval") return true;
   const valueFlags: Record<string, Set<string>> = {
     node: new Set(["-e", "--eval", "-p", "--print"]),
     python: new Set(["-c"]),
@@ -311,9 +316,14 @@ function hasOpaqueInlineCode(command: string, args: string[]): boolean {
     bun: new Set(["-e", "--eval", "-p", "--print"]),
   };
   const flags = valueFlags[command];
-  if (!flags) return false;
-  return args.some((arg) => flags.has(arg) ||
-    [...flags].some((flag) => flag.startsWith("--") ? arg.startsWith(`${flag}=`) : arg.startsWith(flag) && arg.length > flag.length));
+  for (const arg of args) {
+    if (arg === "--") return false;
+    if (!arg.startsWith("-")) return (command === "deno" || command === "bun") && arg === "eval";
+    if (flags?.has(arg)) return true;
+    if (flags && [...flags].some((flag) =>
+      flag.startsWith("--") ? arg.startsWith(`${flag}=`) : arg.startsWith(flag) && arg.length > flag.length)) return true;
+  }
+  return false;
 }
 
 function recursiveCopyTargets(source: string, destination: string, limit = 10_000): string[] {
@@ -458,6 +468,7 @@ export class GuardAnalyzer {
     const creations: string[] = [];
     const trashable: string[] = [];
     const reasons: string[] = [];
+    const unknownCommands: NonNullable<Analysis["unknownCommands"]> = [];
     let baseDecision: Decision = "allow";
 
     for (const segment of splitSegments(tokens)) {
@@ -536,13 +547,12 @@ export class GuardAnalyzer {
       const cmd = commandName(executableRaw);
       const args = strings.slice(index + 1).filter((arg) => !REDIRECT_OPS.has(arg));
 
+      const gitInvocation = cmd === "git" ? parseGitInvocation(args) : undefined;
+      if (gitInvocation && isDestructiveGitInvocation(gitInvocation)) {
+        return this.result("deny", [`Destructive Git operation (${gitInvocation.subcommand}) is prohibited`]);
+      }
       if (cmd === "git") {
-        const invocation = parseGitInvocation(args);
-        const destructive =
-          (invocation.subcommand === "push" && invocation.args.some((arg) => arg === "-f" || arg.startsWith("--force"))) ||
-          (invocation.subcommand === "reset" && invocation.args.includes("--hard")) ||
-          (invocation.subcommand === "clean" && invocation.args.some((arg) => /^-[A-Za-z]*f/.test(arg)));
-        if (destructive) return this.result("deny", [`Destructive Git operation (${invocation.subcommand}) is prohibited`]);
+        const invocation = gitInvocation!;
         const readOnly = isReadOnlyGitOperation(invocation);
         if (!readOnly) {
           baseDecision = strongest(baseDecision, "ask");
@@ -697,6 +707,7 @@ export class GuardAnalyzer {
               accesses.push(...nested.accesses);
               creations.push(...nested.creationCandidates);
               trashable.push(...nested.trashablePaths);
+              unknownCommands.push(...(nested.unknownCommands ?? []));
             } else {
               baseDecision = strongest(baseDecision, "ask");
               reasons.push(`Shell interpreter ${cmd} has an unresolved inline command`);
@@ -723,7 +734,7 @@ export class GuardAnalyzer {
         const screening = this.screenScript(executable, cwd);
         if (screening) return this.result("deny", [`Prohibited script content: ${screening}`]);
         if (this.policy.isSystemReadonlyPath(executable)) {
-          const systemCategory = this.policy.commandCategory(cmd) ?? builtinCommandCategory(cmd);
+          const systemCategory = builtinCommandCategory(cmd);
           if (!systemCategory) {
             baseDecision = strongest(baseDecision, "ask");
             reasons.push(`Unknown system command ${cmd} requires approval`);
@@ -741,7 +752,7 @@ export class GuardAnalyzer {
         continue;
       }
 
-      const category = this.policy.commandCategory(cmd) ?? builtinCommandCategory(cmd);
+      const category = builtinCommandCategory(cmd);
       if (category) {
         const categorized = this.analyzeCategorizedCommand(category, cmd, args, cwd, shellEnvironment);
         baseDecision = strongest(baseDecision, categorized.decision);
@@ -752,7 +763,15 @@ export class GuardAnalyzer {
         continue;
       }
 
+      if (this.policy.isTrustedCommand(cmd, args)) {
+        for (const arg of args.filter((value) => looksLikePath(value) || /[*?\[]/.test(value) || pathExists(this.path(value, cwd)))) {
+          accesses.push({ path: this.path(arg, cwd), kind: "unknown", source: cmd, literal: true });
+        }
+        continue;
+      }
+
       baseDecision = strongest(baseDecision, "ask");
+      unknownCommands.push({ name: cmd, arguments: args });
       const unresolvedVariables = [...executableRaw.matchAll(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g)]
         .map((match) => `$${match[1] ?? match[2]}`);
       reasons.push(unresolvedVariables.length
@@ -765,6 +784,10 @@ export class GuardAnalyzer {
 
     const finalized = this.finalize(accesses, creations, trashable, reasons);
     finalized.decision = strongest(finalized.decision, baseDecision);
+    if (unknownCommands.length) finalized.unknownCommands = unknownCommands.filter((item, index, all) =>
+      all.findIndex((candidate) => candidate.name === item.name &&
+        candidate.arguments.length === item.arguments.length &&
+        candidate.arguments.every((value, argIndex) => value === item.arguments[argIndex])) === index);
     return finalized;
   }
 
@@ -875,14 +898,16 @@ export class GuardAnalyzer {
         continue;
       }
       const ownership = this.policy.ownership(access.path);
-      if (access.kind === "execute" && ownership !== "full") {
+      const canEdit = ownership === "edit" || ownership === "full";
+      const canExecute = ownership === "execute" || ownership === "full";
+      if (access.kind === "execute" && !canExecute) {
         decision = strongest(decision, "ask");
-        reasons.push(`Execution requires full ownership or one-time approval: ${access.path}`);
-        ownershipCandidates.push({ path: access.path, required: "full" });
-      } else if (access.kind === "delete" && ownership === "read") {
+        reasons.push(`Execution requires execute ownership or one-time approval: ${access.path}`);
+        ownershipCandidates.push({ path: access.path, required: "execute" });
+      } else if (access.kind === "delete" && !canEdit) {
         decision = "deny";
-        reasons.push(`Permanent deletion of an unowned path is prohibited: ${access.path}`);
-      } else if (["edit", "unknown"].includes(access.kind) && ownership === "read") {
+        reasons.push(`Permanent deletion without edit ownership is prohibited: ${access.path}`);
+      } else if (["edit", "unknown"].includes(access.kind) && !canEdit) {
         decision = strongest(decision, "ask");
         reasons.push(`Modification requires edit ownership or one-time approval: ${access.path}`);
         ownershipCandidates.push({ path: access.path, required: "edit" });

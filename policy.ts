@@ -2,7 +2,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSy
 import { spawnSync } from "node:child_process";
 import { dirname, isAbsolute, join, normalize, relative } from "node:path";
 import { homedir } from "node:os";
-import type { CommandCategory, CommandRule, OwnershipLevel, PolicyFile, PolicyIssue } from "./types.ts";
+import type { OwnershipLevel, PolicyFile, PolicyIssue } from "./types.ts";
 import { canonicalPath, globToRegExp, isWithin, resolvePath } from "./path-utils.ts";
 
 const DEFAULT_SECRET_PATTERNS = [
@@ -18,7 +18,13 @@ interface LoadedPolicy { file: PolicyFile; path: string; base: string; scope: Po
 
 type PolicyInput = Omit<PolicyFile, "tools"> & { tools?: PolicyFile["tools"] };
 export function emptyPolicy(): PolicyFile {
-  return { version: 2, ownership: { edit: [], full: [] }, secrets: [], commands: [], tools: { read: [] } };
+  return {
+    version: 3,
+    ownership: { edit: [], execute: [], full: [] },
+    secrets: [],
+    commands: { include: [], exclude: [] },
+    tools: { read: [] },
+  };
 }
 
 function validateStrings(value: unknown, field: string): string[] {
@@ -28,32 +34,64 @@ function validateStrings(value: unknown, field: string): string[] {
   return [...value];
 }
 
+function validateCommandEntries(value: unknown, field: string): string[][] {
+  if (!Array.isArray(value)) throw new Error(`${field} must be an array`);
+  return value.map((entry, index) => {
+    if (!Array.isArray(entry) || entry.length === 0 || !entry.every((item) => typeof item === "string")) {
+      throw new Error(`${field}[${index}] must be a non-empty array of strings`);
+    }
+    if (entry.slice(0, -1).includes("**")) throw new Error(`${field}[${index}] may use ** only as its final member`);
+    return [...entry];
+  });
+}
+
+export function parsePermissionTimeout(value: 0 | string | undefined): number {
+  if (value === undefined || value === 0) return 0;
+  const match = value.match(/^(?:(\d+)m)?(?:(\d+)s)?$/);
+  if (!match || (!match[1] && !match[2])) throw new Error("permissionTimeout must be 0 or a duration such as 1m30s");
+  const timeoutMs = (Number(match[1] ?? 0) * 60 + Number(match[2] ?? 0)) * 1_000;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs > 2_147_483_647) throw new Error("permissionTimeout is too large");
+  return timeoutMs;
+}
+
 function validatePolicy(value: unknown): PolicyFile {
   if (!value || typeof value !== "object") throw new Error("policy must be an object");
   const obj = value as Record<string, unknown>;
-  if (obj.version !== 2) throw new Error("version must be 2; edit this policy manually (automatic migration is disabled)");
+  if (obj.version !== 3) throw new Error("version must be 3; edit this policy manually (automatic migration is disabled)");
   if (!obj.ownership || typeof obj.ownership !== "object" || Array.isArray(obj.ownership)) {
-    throw new Error("ownership must contain edit and full pattern lists");
+    throw new Error("ownership must contain edit, execute, and full pattern lists");
   }
   const ownership = obj.ownership as Record<string, unknown>;
   const edit = validateStrings(ownership.edit, "ownership.edit");
+  const execute = validateStrings(ownership.execute, "ownership.execute");
   const full = validateStrings(ownership.full, "ownership.full");
   const secrets = validateStrings(obj.secrets, "secrets");
-  const rawCommands = obj.commands ?? [];
-  if (!Array.isArray(rawCommands)) throw new Error("commands must be an array");
-  const categories = new Set<CommandCategory>(["allow", "read", "create", "edit", "delete", "execute", "remote", "deny"]);
-  const commands = rawCommands.map((raw, index): CommandRule => {
-    if (!raw || typeof raw !== "object") throw new Error(`commands[${index}] must be an object`);
-    const rule = raw as Record<string, unknown>;
-    if (typeof rule.name !== "string" || !categories.has(rule.category as CommandCategory)) {
-      throw new Error(`commands[${index}] requires a name and valid category`);
-    }
-    return { name: rule.name, category: rule.category as CommandCategory, ...(typeof rule.note === "string" ? { note: rule.note } : {}) };
-  });
+
+  if (!obj.commands || typeof obj.commands !== "object" || Array.isArray(obj.commands)) {
+    throw new Error("commands must contain include and exclude entry lists");
+  }
+  const rawCommands = obj.commands as Record<string, unknown>;
+  const commands = {
+    include: validateCommandEntries(rawCommands.include, "commands.include"),
+    exclude: validateCommandEntries(rawCommands.exclude, "commands.exclude"),
+  };
+
   const rawTools = obj.tools ?? {};
   if (!rawTools || typeof rawTools !== "object" || Array.isArray(rawTools)) throw new Error("tools must contain a read list");
   const readTools = validateStrings((rawTools as Record<string, unknown>).read ?? [], "tools.read");
-  return { version: 2, ownership: { edit, full }, secrets, commands, tools: { read: readTools } };
+  const permissionTimeout = obj.permissionTimeout as 0 | string | undefined;
+  if (permissionTimeout !== undefined && permissionTimeout !== 0 && typeof permissionTimeout !== "string") {
+    throw new Error("permissionTimeout must be 0 or a duration string");
+  }
+  parsePermissionTimeout(permissionTimeout);
+  return {
+    version: 3,
+    ownership: { edit, execute, full },
+    secrets,
+    commands,
+    tools: { read: readTools },
+    ...(permissionTimeout === undefined ? {} : { permissionTimeout }),
+  };
 }
 
 function parseOwnershipPattern(entry: string): { pattern: string; included: boolean } | undefined {
@@ -62,6 +100,50 @@ function parseOwnershipPattern(entry: string): { pattern: string; included: bool
   if (value.startsWith("\\!") || value.startsWith("\\#")) value = value.slice(1);
   else if (value.startsWith("!")) return { pattern: value.slice(1), included: false };
   return { pattern: value, included: true };
+}
+
+function commandGlob(pattern: string): RegExp {
+  let source = "^";
+  let escaped = false;
+  for (const character of pattern) {
+    if (escaped) {
+      source += character.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+      escaped = false;
+    } else if (character === "\\") escaped = true;
+    else if (character === "*") source += ".*";
+    else if (character === "?") source += ".";
+    else source += character.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+  }
+  if (escaped) source += "\\\\";
+  return new RegExp(`${source}$`);
+}
+
+function escapeCommandPattern(value: string): string {
+  return value.replace(/[\\*?]/g, "\\$&");
+}
+
+function unorderedArgumentsMatch(patterns: string[], args: string[], allowRest: boolean): boolean {
+  if (patterns.length > args.length || (!allowRest && patterns.length !== args.length)) return false;
+  const used = new Set<number>();
+  const visit = (patternIndex: number): boolean => {
+    if (patternIndex === patterns.length) return true;
+    const expression = commandGlob(patterns[patternIndex]!);
+    for (let argIndex = 0; argIndex < args.length; argIndex++) {
+      if (used.has(argIndex) || !expression.test(args[argIndex]!)) continue;
+      used.add(argIndex);
+      if (visit(patternIndex + 1)) return true;
+      used.delete(argIndex);
+    }
+    return false;
+  };
+  return visit(0);
+}
+
+function commandEntryMatches(entry: string[], name: string, args: string[]): boolean {
+  if (!commandGlob(entry[0]!).test(name)) return false;
+  const allowRest = entry.at(-1) === "**";
+  const patterns = allowRest ? entry.slice(1, -1) : entry.slice(1);
+  return unorderedArgumentsMatch(patterns, args, allowRest);
 }
 
 export interface ProcessIoRoots {
@@ -197,7 +279,7 @@ export class PolicyStore {
     return new RegExp(`(?:${exact.source})|(?:${descendants.source})`);
   }
 
-  private includedIn(level: "edit" | "full", canonical: string): boolean {
+  private includedIn(level: "edit" | "execute" | "full", canonical: string): boolean {
     let included = false;
     for (const policy of this.policies) {
       for (const entry of policy.file.ownership[level]) {
@@ -210,12 +292,13 @@ export class PolicyStore {
 
   ownership(path: string): OwnershipLevel {
     const canonical = canonicalPath(path);
-    for (const root of [...this.transientRun, ...this.transientSession]) {
-      if (isWithin(canonical, root)) return "edit";
-    }
     if (this.includedIn("full", canonical)) return "full";
-    if (this.gitTrackedPaths.has(canonical)) return "edit";
-    if (this.includedIn("edit", canonical)) return "edit";
+    const transientEdit = [...this.transientRun, ...this.transientSession].some((root) => isWithin(canonical, root));
+    const canEdit = transientEdit || this.gitTrackedPaths.has(canonical) || this.includedIn("edit", canonical);
+    const canExecute = this.includedIn("execute", canonical);
+    if (canEdit && canExecute) return "full";
+    if (canEdit) return "edit";
+    if (canExecute) return "execute";
     return "read";
   }
 
@@ -233,8 +316,17 @@ export class PolicyStore {
     return false;
   }
 
-  commandCategory(name: string): CommandCategory | undefined {
-    return this.policies.flatMap((policy) => policy.file.commands).findLast((rule) => rule.name === name)?.category;
+  isTrustedCommand(name: string, args: string[]): boolean {
+    const included = this.policies.some((policy) =>
+      policy.file.commands.include.some((entry) => commandEntryMatches(entry, name, args)));
+    if (!included) return false;
+    return !this.policies.some((policy) =>
+      policy.file.commands.exclude.some((entry) => commandEntryMatches(entry, name, args)));
+  }
+
+  permissionTimeoutMs(): number {
+    const value = this.policies.findLast((policy) => policy.file.permissionTimeout !== undefined)?.file.permissionTimeout;
+    return parsePermissionTimeout(value);
   }
 
   isReadOnlyTool(name: string): boolean {
@@ -258,11 +350,11 @@ export class PolicyStore {
 
   ensurePolicy(scope: PolicyScope): string {
     const path = this.getPolicyPath(scope);
-    if (!existsSync(path)) this.write(scope, emptyPolicy());
+    if (!existsSync(path)) this.write(scope, scope === "global" ? { ...emptyPolicy(), permissionTimeout: 0 } : emptyPolicy());
     return path;
   }
 
-  appendOwnership(scope: PolicyScope, level: "edit" | "full", path: string): { path: string; line: number } {
+  appendOwnership(scope: PolicyScope, level: "edit" | "execute" | "full", path: string): { path: string; line: number } {
     const policyPath = this.ensurePolicy(scope);
     const current = validatePolicy(JSON.parse(readFileSync(policyPath, "utf8")));
     const pattern = canonicalPath(path);
@@ -272,6 +364,24 @@ export class PolicyStore {
     const lines = written.content.split("\n");
     const line = lines.findLastIndex((value) => value.includes(quoted)) + 1;
     return { path: written.path, line: Math.max(1, line) };
+  }
+
+  appendTrustedCommand(scope: PolicyScope, name: string, args: string[]): { path: string; line: number } {
+    const policyPath = this.ensurePolicy(scope);
+    const current = validatePolicy(JSON.parse(readFileSync(policyPath, "utf8")));
+    const entry = [name, ...args].map(escapeCommandPattern);
+    if (!current.commands.include.some((existing) =>
+      existing.length === entry.length && existing.every((value, index) => value === entry[index]))) {
+      current.commands.include.push(entry);
+    }
+    const written = this.write(scope, current);
+    const lines = written.content.split("\n");
+    const includeStart = lines.findIndex((value) => value.includes('"include"'));
+    const excludeStart = lines.findIndex((value, index) => index > includeStart && value.includes('"exclude"'));
+    const boundary = excludeStart < 0 ? lines.length : excludeStart;
+    let entryStart = boundary - 1;
+    while (entryStart > includeStart && lines[entryStart]?.trim() !== "[") entryStart--;
+    return { path: written.path, line: Math.max(1, entryStart + 2) };
   }
 
   appendReadOnlyTool(scope: PolicyScope, name: string): { path: string; line: number } {

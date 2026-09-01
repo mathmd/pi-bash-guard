@@ -1,12 +1,17 @@
 {
-  "version": 2,
+  "version": 3,
   "ownership": {
     "edit": [],
+    "execute": [],
     "full": []
   },
   "secrets": [],
-  "commands": [],
+  "commands": {
+    "include": [],
+    "exclude": []
+  },
   "tools": {
     "read": []
-  }
+  },
+  "permissionTimeout": 0
 }

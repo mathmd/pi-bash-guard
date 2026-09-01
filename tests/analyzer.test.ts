@@ -229,12 +229,29 @@ test("edit ownership permits editing and deletion but still asks execution", () 
   } finally { f.cleanup(); }
 });
 
+test("execute ownership permits execution but not editing or deletion", () => {
+  const f = fixture();
+  try {
+    const file = join(f.workspace, "execute-only.sh");
+    writeFileSync(file, "echo safe\n");
+    f.policy.save("local", {
+      version: 3,
+      ownership: { edit: [], execute: ["execute-only.sh"], full: [] },
+      secrets: [],
+      commands: { include: [], exclude: [] },
+    });
+    assert.equal(f.analyzer.analyzeCommand(`bash ${file}`, f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand(`touch ${file}`, f.workspace).decision, "ask");
+    assert.equal(f.analyzer.analyzeCommand(`rm ${file}`, f.workspace).decision, "deny");
+  } finally { f.cleanup(); }
+});
+
 test("full ownership permits screened script execution", () => {
   const f = fixture();
   try {
     const file = join(f.workspace, "trusted.sh");
     writeFileSync(file, "echo safe\n");
-    f.policy.save("local", { version: 2, ownership: { edit: [], full: ["trusted.sh"] }, secrets: [], commands: [] });
+    f.policy.save("local", { version: 3, ownership: { edit: [], execute: [], full: ["trusted.sh"] }, secrets: [], commands: { include: [], exclude: [] } });
     assert.equal(f.analyzer.analyzeCommand(`bash ${file}`, f.workspace).decision, "allow");
   } finally { f.cleanup(); }
 });
@@ -311,7 +328,7 @@ test("catastrophic content in a script is denied even with full ownership", () =
   try {
     const script = join(f.workspace, "bad.sh");
     writeFileSync(script, "#!/bin/sh\nmkfs /dev/example\n");
-    f.policy.save("local", { version: 2, ownership: { edit: [], full: ["bad.sh"] }, secrets: [], commands: [] });
+    f.policy.save("local", { version: 3, ownership: { edit: [], execute: [], full: ["bad.sh"] }, secrets: [], commands: { include: [], exclude: [] } });
     assert.equal(f.analyzer.analyzeCommand(`bash ${script}`, f.workspace).decision, "deny");
   } finally { f.cleanup(); }
 });
@@ -323,7 +340,7 @@ test("explicit secret references in a full-owned script are denied", () => {
     const script = join(f.workspace, "secret-reader.sh");
     writeFileSync(secret, "TOKEN=test\n");
     writeFileSync(script, `#!/bin/sh\ncat ${secret}\n`);
-    f.policy.save("local", { version: 2, ownership: { edit: [], full: ["secret-reader.sh"] }, secrets: [], commands: [] });
+    f.policy.save("local", { version: 3, ownership: { edit: [], execute: [], full: ["secret-reader.sh"] }, secrets: [], commands: { include: [], exclude: [] } });
     assert.equal(f.analyzer.analyzeCommand(`bash ${script}`, f.workspace).decision, "deny");
   } finally { f.cleanup(); }
 });
@@ -488,6 +505,11 @@ test("non-shell inline interpreters are opaque rather than parsed as shell", () 
       assert.match(result.reasons.join(" "), /Opaque .* inline code requires approval/, command);
       assert.doesNotMatch(result.reasons.join(" "), /Shell syntax could not be analyzed/, command);
     }
+    const nodeScript = join(f.workspace, "runner.js");
+    writeFileSync(nodeScript, "console.log('safe')\n");
+    const scriptWithFlag = f.analyzer.analyzeCommand(`node ${nodeScript} -p config.json`, f.workspace);
+    assert.equal(scriptWithFlag.decision, "ask");
+    assert.doesNotMatch(scriptWithFlag.reasons.join(" "), /Opaque node inline code/);
   } finally { f.cleanup(); }
 });
 
@@ -504,21 +526,45 @@ test("tee creates new files but asks before editing existing files", () => {
   } finally { f.cleanup(); }
 });
 
-test("custom command registration overrides unknown-command fallback", () => {
+test("trusted command patterns override unknown fallback only when arguments match", () => {
   const f = fixture();
   try {
     f.policy.save("local", {
-      version: 2,
-      ownership: { edit: [], full: [] },
+      version: 3,
+      ownership: { edit: [], execute: [], full: [] },
       secrets: [],
-      commands: [
-        { name: "inspect-local", category: "read" },
-        { name: "safe-local", category: "allow" },
-        { name: "forbidden-local", category: "deny" },
-      ],
+      commands: {
+        include: [
+          ["safe-local"],
+          ["inspect-*", "--json", "**"],
+          ["unordered", "one", "two"],
+        ],
+        exclude: [["inspect-*", "--write", "**"]],
+      },
     });
     assert.equal(f.analyzer.analyzeCommand("safe-local", f.workspace).decision, "allow");
-    assert.equal(f.analyzer.analyzeCommand("inspect-local", f.workspace).decision, "allow");
-    assert.equal(f.analyzer.analyzeCommand("forbidden-local", f.workspace).decision, "deny");
+    assert.equal(f.analyzer.analyzeCommand("safe-local extra", f.workspace).decision, "ask");
+    assert.equal(f.analyzer.analyzeCommand("inspect-local file --json", f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand("inspect-local --write --json", f.workspace).decision, "ask");
+    assert.equal(f.analyzer.analyzeCommand("unordered two one", f.workspace).decision, "allow");
+
+    const pathArgument = join(f.workspace, "input.txt");
+    writeFileSync(pathArgument, "input\n");
+    const guardedPath = f.analyzer.analyzeCommand(`inspect-local --json ${pathArgument}`, f.workspace);
+    assert.equal(guardedPath.decision, "ask");
+    assert.deepEqual(guardedPath.ownershipCandidates, [{ path: pathArgument, required: "edit" }]);
+    f.policy.addCreated(pathArgument);
+    assert.equal(f.analyzer.analyzeCommand(`inspect-local ${pathArgument} --json`, f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand(`inspect-local --json ${join(f.workspace, ".env")}`, f.workspace).decision, "deny");
+    assert.equal(f.analyzer.analyzeCommand(`inspect-local --json ${join(f.workspace, ".git", "config")}`, f.workspace).decision, "deny");
+
+    f.policy.save("local", {
+      version: 3,
+      ownership: { edit: [], execute: [], full: [] },
+      secrets: [],
+      commands: { include: [["*", "**"]], exclude: [] },
+    });
+    assert.equal(f.analyzer.analyzeCommand("anything --any-flag", f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand("git reset --hard HEAD", f.workspace).decision, "deny");
   } finally { f.cleanup(); }
 });

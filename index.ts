@@ -25,6 +25,10 @@ function mergeAnalyses(items: Analysis[]): Analysis {
     trashablePaths: [...new Set([...result.trashablePaths, ...item.trashablePaths])],
     ownershipCandidates: [...result.ownershipCandidates, ...item.ownershipCandidates].filter((candidate, index, all) =>
       all.findIndex((other) => other.path === candidate.path && other.required === candidate.required) === index),
+    unknownCommands: [...(result.unknownCommands ?? []), ...(item.unknownCommands ?? [])].filter((candidate, index, all) =>
+      all.findIndex((other) => other.name === candidate.name &&
+        other.arguments.length === candidate.arguments.length &&
+        other.arguments.every((value, argIndex) => value === candidate.arguments[argIndex])) === index),
   }), { decision: "allow", reasons: [], accesses: [], creationCandidates: [], trashablePaths: [], ownershipCandidates: [] });
 }
 
@@ -59,6 +63,11 @@ function executableBindingDetails(unit: CommandAnalysisUnit): string {
   const bindings = unit.executableBindings.map(({ name, value }) =>
     `$${name} = ${value === undefined ? "<unresolved at analysis time>" : JSON.stringify(value)}`);
   return `\n\nExecutable variable${bindings.length === 1 ? "" : "s"}:\n${bindings.join("\n")}`;
+}
+
+function suggestedTrustedCommand(analysis: Analysis): { name: string; arguments: string[] } | undefined {
+  return analysis.unknownCommands?.find((candidate) =>
+    [candidate.name, ...candidate.arguments].every((value) => !/\$(?:\(|\{|[A-Za-z_0-9])|`/.test(value)));
 }
 
 export default function bashGuard(pi: ExtensionAPI): void {
@@ -118,38 +127,43 @@ export default function bashGuard(pi: ExtensionAPI): void {
     }
 
     for (const item of promptItems) {
-      const refreshedUnit = item.unitIndex !== undefined && isToolCallEventType("bash", event)
-        ? analyzer!.analyzeCommandUnits(event.input.command, ctx.cwd)[item.unitIndex]
-        : undefined;
-      const itemAnalysis = refreshedUnit?.analysis ?? item.analysis;
-      if (itemAnalysis.decision === "allow") continue;
-      const promptAnalysis = promptItems.length > 1 && itemAnalysis.trashablePaths.length
-        ? {
-            ...itemAnalysis,
-            trashablePaths: [],
-            reasons: [...itemAnalysis.reasons, "Run this deletion separately to use reversible trash substitution"],
-          }
-        : itemAnalysis;
-      if (ctx.mode === "tui" && ctx.hasUI) {
-        sendSystemNotification("Pi requires permission", `${item.subject}\n${promptAnalysis.reasons.join("\n")}`);
-      }
-      const readOnlyTool = !isToolCallEventType("bash", event) &&
-        itemAnalysis.accesses.some((access) => access.kind === "unknown" && access.source === event.toolName)
-        ? event.toolName
-        : undefined;
-      const response = await promptForDecision(ctx, policy!, promptAnalysis, item.subject, readOnlyTool);
-      if (response.action === "allow") continue;
-      if (response.action === "trash" && isToolCallEventType("bash", event) && itemAnalysis.trashablePaths.length && promptItems.length === 1) {
-        // Replace, rather than execute inside the hook, so Pi records the actual reversible operation.
-        event.input.command = shellQuote(["gio", "trash", "--", ...itemAnalysis.trashablePaths]);
+      while (true) {
+        const refreshedUnit = item.unitIndex !== undefined && isToolCallEventType("bash", event)
+          ? analyzer!.analyzeCommandUnits(event.input.command, ctx.cwd)[item.unitIndex]
+          : undefined;
+        const itemAnalysis = refreshedUnit?.analysis ??
+          (item.unitIndex === undefined ? analyzeTool(event, ctx.cwd, analyzer!, policy!) : item.analysis);
+        if (itemAnalysis.decision === "allow") break;
+        const promptAnalysis = promptItems.length > 1 && itemAnalysis.trashablePaths.length
+          ? {
+              ...itemAnalysis,
+              trashablePaths: [],
+              reasons: [...itemAnalysis.reasons, "Run this deletion separately to use reversible trash substitution"],
+            }
+          : itemAnalysis;
+        if (ctx.mode === "tui" && ctx.hasUI) {
+          sendSystemNotification("Pi requires permission", `${item.subject}\n${promptAnalysis.reasons.join("\n")}`);
+        }
+        const readOnlyTool = !isToolCallEventType("bash", event) &&
+          itemAnalysis.accesses.some((access) => access.kind === "unknown" && access.source === event.toolName)
+          ? event.toolName
+          : undefined;
+        const trustedCommand = isToolCallEventType("bash", event) ? suggestedTrustedCommand(itemAnalysis) : undefined;
+        const response = await promptForDecision(ctx, policy!, promptAnalysis, item.subject, readOnlyTool, trustedCommand);
+        if (response.action === "allow") break;
+        if (response.action === "reevaluate") continue;
+        if (response.action === "trash" && isToolCallEventType("bash", event) && itemAnalysis.trashablePaths.length && promptItems.length === 1) {
+          // Replace, rather than execute inside the hook, so Pi records the actual reversible operation.
+          event.input.command = shellQuote(["gio", "trash", "--", ...itemAnalysis.trashablePaths]);
+          pending.delete(event.toolCallId);
+          return;
+        }
         pending.delete(event.toolCallId);
-        return;
+        return {
+          block: true,
+          reason: `Blocked by bash-guard.${response.context ? ` User context: ${response.context}` : ""} ${itemAnalysis.reasons.join(" ")}`,
+        };
       }
-      pending.delete(event.toolCallId);
-      return {
-        block: true,
-        reason: `Blocked by bash-guard.${response.context ? ` User context: ${response.context}` : ""} ${itemAnalysis.reasons.join(" ")}`,
-      };
     }
     return;
   });

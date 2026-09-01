@@ -1,25 +1,26 @@
 export type Decision = "allow" | "ask" | "deny";
-export type OwnershipLevel = "read" | "edit" | "full";
+export type OwnershipLevel = "read" | "edit" | "execute" | "full";
 export type CommandCategory = "allow" | "read" | "create" | "edit" | "delete" | "execute" | "remote" | "deny";
 export type AccessKind = "read" | "edit" | "delete" | "execute" | "remote" | "unknown";
 
 export interface OwnershipPatterns {
   edit: string[];
+  execute: string[];
   full: string[];
 }
 
-export interface CommandRule {
-  name: string;
-  category: CommandCategory;
-  note?: string;
+export interface CommandPatterns {
+  include: string[][];
+  exclude: string[][];
 }
 
 export interface PolicyFile {
-  version: 2;
+  version: 3;
   ownership: OwnershipPatterns;
   secrets: string[];
-  commands: CommandRule[];
+  commands: CommandPatterns;
   tools: { read: string[] };
+  permissionTimeout?: 0 | string;
 }
 
 export interface PathAccess {
@@ -36,7 +37,8 @@ export interface Analysis {
   accesses: PathAccess[];
   creationCandidates: string[];
   trashablePaths: string[];
-  ownershipCandidates: Array<{ path: string; required: "edit" | "full" }>;
+  ownershipCandidates: Array<{ path: string; required: "edit" | "execute" | "full" }>;
+  unknownCommands?: Array<{ name: string; arguments: string[] }>;
 }
 
 export interface PolicyIssue {
