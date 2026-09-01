@@ -25,6 +25,13 @@ export function shellBindingDetails(unit: CommandAnalysisUnit): string {
   if (resolved.length) {
     sections.push(`Resolved shell variable${resolved.length === 1 ? "" : "s"}:\n${resolved.map(({ name, value }) => `$${name} = ${JSON.stringify(value)}`).join("\n")}`);
   }
+  for (const expansion of unit.analysis.pathExpansions ?? []) {
+    const values = expansion.unresolved
+      ? ["<unresolved at analysis time>"]
+      : expansion.matches.length ? expansion.matches : ["<no existing matches>"];
+    if (expansion.truncated) values.push(`<more than ${expansion.matches.length} matches; analysis stopped>`);
+    sections.push(`Expanded shell path ${JSON.stringify(expansion.expression)}:\n${values.map((value) => `  ${value}`).join("\n")}`);
+  }
   return sections.length ? `\n\n${sections.join("\n\n")}` : "";
 }
 

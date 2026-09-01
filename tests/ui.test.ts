@@ -67,3 +67,16 @@ test("permission details show statically resolved shell values", () => {
     '\n\nResolved shell variable:\n$store = "/nix/store/example"',
   );
 });
+
+test("permission details list concrete shell glob matches", () => {
+  const details = shellBindingDetails({
+    command: "unknown-inspector scripts/*.lua",
+    analysis: {
+      decision: "ask", reasons: [], accesses: [], creationCandidates: [], trashablePaths: [], ownershipCandidates: [],
+      pathExpansions: [{ expression: "scripts/*.lua", matches: ["/tmp/project/scripts/a.lua", "/tmp/project/scripts/b.lua"] }],
+    },
+  });
+  assert.match(details, /Expanded shell path "scripts\/\*\.lua"/);
+  assert.match(details, /\/tmp\/project\/scripts\/a\.lua/);
+  assert.match(details, /\/tmp\/project\/scripts\/b\.lua/);
+});

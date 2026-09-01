@@ -1,9 +1,9 @@
-import { lstatSync, readFileSync, readdirSync } from "node:fs";
+import { globSync, lstatSync, readFileSync, readdirSync } from "node:fs";
 import { basename, join } from "node:path";
 import { parse as shellParse, type ParseToken } from "shell-quote";
-import type { AccessKind, Analysis, CommandCategory, Decision, PathAccess } from "./types.ts";
+import type { AccessKind, Analysis, CommandCategory, Decision, PathAccess, PathExpansion } from "./types.ts";
 import { strongest } from "./types.ts";
-import { canonicalPath, containsGitMetadata, looksLikePath, pathExists, pathIsDirectory, resolvePath } from "./path-utils.ts";
+import { canonicalPath, containsGitMetadata, expandHome, looksLikePath, pathExists, pathIsDirectory, resolvePath } from "./path-utils.ts";
 import type { PolicyStore } from "./policy.ts";
 import { builtinCommandCategory, SHELL_CLOSING_WORDS, SHELL_HEADER_WORDS, SHELL_PREFIX_WORDS } from "./command-catalog.ts";
 
@@ -11,7 +11,7 @@ type OpToken = { op: string };
 type GlobToken = { op: "glob"; pattern: string };
 const CONTROL_OPS = new Set(["|", "|&", "&&", "||", ";", "&", "(", ")"]);
 const REDIRECT_OPS = new Set([">", ">>", "1>", "1>>", "2>", "2>>", "&>", "&>>", ">&", "<&", "<<<", "<"]);
-const INTERPRETERS = new Set(["bash", "sh", "zsh", "fish", "python", "python3", "node", "ruby", "perl", "deno", "bun"]);
+const INTERPRETERS = new Set(["bash", "sh", "zsh", "fish", "python", "python3", "node", "ruby", "perl", "lua", "luajit", "deno", "bun"]);
 const SHELL_INTERPRETERS = new Set(["bash", "sh", "zsh", "fish"]);
 const GIT_READ_SUBCOMMANDS = new Set([
   "status", "diff", "diff-files", "diff-index", "diff-tree", "log", "show", "rev-parse", "ls-files", "grep",
@@ -251,7 +251,7 @@ function cleanArgs(values: string[]): string[] {
 }
 
 function isLiteralShellPath(value: string): boolean {
-  return !/[*?$`\[]/.test(value);
+  return !/\$(?:\(|\{|[A-Za-z_0-9])|`/.test(value);
 }
 
 function splitSegments(tokens: ParseToken[]): ParseToken[][] {
@@ -340,9 +340,34 @@ function persistentAssignmentUpdates(command: string, environment: ShellEnvironm
   return updates;
 }
 
+const MAX_GLOB_MATCHES = 512;
+
+interface ShellGlobExpansion {
+  argument: string;
+  matches: string[];
+  unresolved: boolean;
+  truncated: boolean;
+}
+
+function expandShellGlob(pattern: string, cwd: string, home: string): ShellGlobExpansion {
+  const argument = expandHome(pattern, home);
+  if (!isStaticallyResolvedValue(argument)) return { argument, matches: [], unresolved: true, truncated: false };
+  try {
+    const allMatches = [...new Set(globSync(argument, { cwd }))].sort();
+    return {
+      argument,
+      matches: allMatches.slice(0, MAX_GLOB_MATCHES),
+      unresolved: false,
+      truncated: allMatches.length > MAX_GLOB_MATCHES,
+    };
+  } catch {
+    return { argument, matches: [], unresolved: true, truncated: false };
+  }
+}
+
 interface StaticLoopBinding { name: string; values: string[]; }
 
-function staticLoopBinding(command: string, environment: ShellEnvironment, home: string): StaticLoopBinding | undefined {
+function staticLoopBinding(command: string, environment: ShellEnvironment, home: string, cwd: string): StaticLoopBinding | undefined {
   if (referencedShellVariables(command).some((name) => name !== "HOME")) return undefined;
   let tokens: ParseToken[];
   try {
@@ -350,11 +375,25 @@ function staticLoopBinding(command: string, environment: ShellEnvironment, home:
   } catch {
     return undefined;
   }
-  if (!tokens.every((token): token is string => typeof token === "string")) return undefined;
-  if (tokens[0] !== "for" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(tokens[1] ?? "") || tokens[2] !== "in") return undefined;
-  const values = tokens.slice(3);
+  const words: string[] = [];
+  for (const token of tokens) {
+    if (typeof token === "string") words.push(token);
+    else if (isGlob(token)) {
+      const expansion = expandShellGlob(token.pattern, cwd, home);
+      if (expansion.unresolved || expansion.truncated) return undefined;
+      words.push(...(expansion.matches.length ? expansion.matches : [expansion.argument]));
+    } else return undefined;
+  }
+  let start = 0;
+  while (SHELL_PREFIX_WORDS.has(words[start] ?? "")) start++;
+  if (words[start] !== "for" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(words[start + 1] ?? "") || words[start + 2] !== "in") return undefined;
+  const values = words.slice(start + 3).filter((value) => value !== "do");
   if (!values.length || values.length > 128 || values.some((value) => /[{}]|\$[({A-Za-z_0-9]/.test(value))) return undefined;
-  return { name: tokens[1]!, values: [...new Set(values)] };
+  const concreteValues = values.map((value) => {
+    const resolved = resolvePath(value, cwd, home);
+    return looksLikePath(value) || pathExists(resolved) ? canonicalPath(resolved) : value;
+  });
+  return { name: words[start + 1]!, values: [...new Set(concreteValues)] };
 }
 
 function referencedShellVariables(command: string): string[] {
@@ -463,6 +502,8 @@ function hasOpaqueInlineCode(command: string, args: string[]): boolean {
     python3: new Set(["-c"]),
     ruby: new Set(["-e"]),
     perl: new Set(["-e", "-E"]),
+    lua: new Set(["-e"]),
+    luajit: new Set(["-e"]),
     bun: new Set(["-e", "--eval", "-p", "--print"]),
   };
   const flags = valueFlags[command];
@@ -526,7 +567,7 @@ export class GuardAnalyzer {
     const loops: Array<{ name: string; values: string[]; previous?: string[] }> = [];
     const results: CommandAnalysisUnit[] = [];
     for (const unit of splitShellCommandUnits(command)) {
-      const loop = staticLoopBinding(unit, environment, this.policy.home);
+      const loop = staticLoopBinding(unit, environment, this.policy.home, cwd);
       if (loop) {
         results.push({ command: unit, analysis: this.analyzeCommand(unit, cwd, environment) });
         loops.push({ name: loop.name, values: loop.values, previous: candidates.get(loop.name) });
@@ -536,11 +577,12 @@ export class GuardAnalyzer {
 
       const referencedNames = referencedShellVariables(unit);
       const executableNames = this.executableVariableNames(unit, cwd, environment);
+      const expansionNames = [...new Set([...executableNames, ...referencedNames.filter((name) => candidates.has(name))])];
       let contexts: Array<{ environment: ShellEnvironment; bindings: Array<{ name: string; value?: string }> }> = [
         { environment: { ...environment }, bindings: [] },
       ];
       let expansionLimited = false;
-      for (const name of executableNames) {
+      for (const name of expansionNames) {
         const assigned = environment[name];
         const values: Array<string | undefined> = candidates.get(name) ??
           (assigned !== undefined && isStaticallyResolvedValue(assigned)
@@ -549,10 +591,10 @@ export class GuardAnalyzer {
         if (contexts.length * values.length > 128) {
           expansionLimited = true;
           const unresolvedEnvironment = { ...environment };
-          for (const variable of executableNames) delete unresolvedEnvironment[variable];
+          for (const variable of expansionNames) delete unresolvedEnvironment[variable];
           contexts = [{
             environment: unresolvedEnvironment,
-            bindings: executableNames.map((variable) => ({ name: variable })),
+            bindings: expansionNames.map((variable) => ({ name: variable })),
           }];
           break;
         }
@@ -571,7 +613,7 @@ export class GuardAnalyzer {
         const analysis = this.analyzeCommand(unit, cwd, context.environment);
         if (expansionLimited) {
           analysis.decision = strongest(analysis.decision, "ask");
-          analysis.reasons.push("Executable variable has more than 128 static candidate combinations and cannot be expanded safely");
+          analysis.reasons.push("Static variable expansion has more than 128 candidate combinations and cannot be analyzed safely");
         }
         const resolvedBindings = referencedNames.flatMap((name) => {
           const value = context.environment[name] ?? (name === "HOME" ? this.policy.home : undefined);
@@ -580,7 +622,9 @@ export class GuardAnalyzer {
         results.push({
           command: unit,
           analysis,
-          ...(context.bindings.length ? { executableBindings: context.bindings } : {}),
+          ...(context.bindings.some(({ name }) => executableNames.includes(name))
+            ? { executableBindings: context.bindings.filter(({ name }) => executableNames.includes(name)) }
+            : {}),
           ...(resolvedBindings.length ? { resolvedBindings } : {}),
         });
       }
@@ -627,6 +671,9 @@ export class GuardAnalyzer {
     const reasons: string[] = [];
     const unknownCommands: NonNullable<Analysis["unknownCommands"]> = [];
     let baseDecision: Decision = "allow";
+    const pathExpansions: PathExpansion[] = [];
+    const unmatchedGlobArguments = new Set<string>();
+    const unresolvedPathArguments = new Set<string>();
 
     for (const source of substitutions.sources) {
       const nested = this.analyzeCommand(source, cwd, shellEnvironment);
@@ -636,13 +683,32 @@ export class GuardAnalyzer {
       creations.push(...nested.creationCandidates);
       trashable.push(...nested.trashablePaths);
       unknownCommands.push(...(nested.unknownCommands ?? []));
+      pathExpansions.push(...(nested.pathExpansions ?? []));
     }
     for (const segment of splitSegments(tokens)) {
       const commandWords: string[] = [];
       for (let i = 0; i < segment.length; i++) {
         const token = segment[i];
         if (isGlob(token)) {
-          commandWords.push(token.pattern);
+          const expansion = expandShellGlob(token.pattern, cwd, this.policy.home);
+          pathExpansions.push({
+            expression: token.pattern,
+            matches: expansion.matches.map((match) => this.path(match, cwd)),
+            ...(expansion.unresolved ? { unresolved: true } : {}),
+            ...(expansion.truncated ? { truncated: true } : {}),
+          });
+          if (expansion.unresolved || expansion.truncated) {
+            unresolvedPathArguments.add(expansion.argument);
+            baseDecision = strongest(baseDecision, "ask");
+            reasons.push(expansion.truncated
+              ? `Wildcard path has more than ${MAX_GLOB_MATCHES} matches and cannot be analyzed completely: ${token.pattern}`
+              : `Dynamic path cannot be resolved statically: ${token.pattern}`);
+            commandWords.push(expansion.argument);
+          } else if (expansion.matches.length) commandWords.push(...expansion.matches);
+          else {
+            unmatchedGlobArguments.add(expansion.argument);
+            commandWords.push(expansion.argument);
+          }
           continue;
         }
         if (isOp(token) && REDIRECT_OPS.has(token.op)) {
@@ -666,13 +732,17 @@ export class GuardAnalyzer {
       if (!strings.length) continue;
       let index = 0;
       while (index < strings.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(strings[index])) index++;
+      while (SHELL_PREFIX_WORDS.has(commandName(strings[index] ?? ""))) index++;
       let word = commandName(strings[index] ?? "");
       if (SHELL_CLOSING_WORDS.has(word)) continue;
       if (SHELL_HEADER_WORDS.has(word)) {
-        if (word === "while" || word === "until") index++;
-        else continue;
+        if (word === "while" || word === "until") {
+          index++;
+          while (SHELL_PREFIX_WORDS.has(commandName(strings[index] ?? ""))) index++;
+          word = commandName(strings[index] ?? "");
+          if (SHELL_CLOSING_WORDS.has(word) || SHELL_HEADER_WORDS.has(word)) continue;
+        } else continue;
       }
-      while (SHELL_PREFIX_WORDS.has(commandName(strings[index] ?? ""))) index++;
       if (commandName(strings[index] ?? "") === "command") {
         let optionIndex = index + 1;
         let inspection = false;
@@ -712,6 +782,20 @@ export class GuardAnalyzer {
       if (!executableRaw) continue;
       const cmd = commandName(executableRaw);
       const args = strings.slice(index + 1).filter((arg) => !REDIRECT_OPS.has(arg));
+      for (const arg of args) {
+        if (isStaticallyResolvedValue(arg) || !arg.includes("/") || /^(?:[A-Za-z][A-Za-z0-9+.-]*):\/\//.test(arg) || unresolvedPathArguments.has(arg)) continue;
+        unresolvedPathArguments.add(arg);
+        baseDecision = strongest(baseDecision, "ask");
+        reasons.push(`Dynamic path cannot be resolved statically: ${arg}`);
+        pathExpansions.push({ expression: arg, matches: [], unresolved: true });
+      }
+      const pathLikeArgument = (value: string): boolean => !unresolvedPathArguments.has(value) &&
+        (unmatchedGlobArguments.has(value) || looksLikePath(value) || pathExists(this.path(value, cwd)));
+      const argumentAccess = (value: string, kind: AccessKind, source: string): PathAccess => {
+        const unmatched = unmatchedGlobArguments.has(value);
+        const path = this.path(value, cwd);
+        return { path, kind, source, literal: unmatched || isLiteralShellPath(value), existed: unmatched ? false : pathExists(path) };
+      };
 
       const gitInvocation = cmd === "git" ? parseGitInvocation(args) : undefined;
       if (gitInvocation && isDestructiveGitInvocation(gitInvocation)) {
@@ -739,7 +823,7 @@ export class GuardAnalyzer {
         continue;
       }
       if (cmd === "nix" && isReadOnlyNixCli(args)) {
-        const categorized = this.analyzeCategorizedCommand("read", cmd, args, cwd, shellEnvironment);
+        const categorized = this.analyzeCategorizedCommand("read", cmd, args, cwd, shellEnvironment, unmatchedGlobArguments, unresolvedPathArguments);
         baseDecision = strongest(baseDecision, categorized.decision);
         reasons.push(...categorized.reasons);
         accesses.push(...categorized.accesses);
@@ -747,7 +831,7 @@ export class GuardAnalyzer {
       }
 
       if (cmd === "nix-store" && isReadOnlyNixStoreQuery(args)) {
-        const categorized = this.analyzeCategorizedCommand("read", cmd, args, cwd, shellEnvironment);
+        const categorized = this.analyzeCategorizedCommand("read", cmd, args, cwd, shellEnvironment, unmatchedGlobArguments, unresolvedPathArguments);
         baseDecision = strongest(baseDecision, categorized.decision);
         reasons.push(...categorized.reasons);
         accesses.push(...categorized.accesses);
@@ -804,11 +888,10 @@ export class GuardAnalyzer {
       }
 
       if (cmd === "rm" || cmd === "rmdir" || cmd === "unlink") {
-        for (const arg of args.filter((value) => !value.startsWith("-"))) {
-          if (!looksLikePath(arg) && !/[*?\[]/.test(arg) && !pathExists(this.path(arg, cwd))) continue;
-          const path = this.path(arg, cwd);
-          accesses.push({ path, kind: "delete", source: cmd, literal: !/[*?$`]/.test(arg), existed: pathExists(path) });
-          if (!/[*?$`]/.test(arg)) trashable.push(path);
+        for (const arg of args.filter((value) => !value.startsWith("-") && pathLikeArgument(value))) {
+          const access = argumentAccess(arg, "delete", cmd);
+          accesses.push(access);
+          if (access.literal) trashable.push(access.path);
         }
         continue;
       }
@@ -885,6 +968,16 @@ export class GuardAnalyzer {
         if (cmd === "sed") continue;
       }
 
+      const luacParseOnly = cmd === "luac" && args.some((arg) => arg === "-p" || /^-[^-]*p/.test(arg)) &&
+        !args.some((arg) => arg === "-o" || arg.startsWith("--output"));
+      if (luacParseOnly) {
+        const categorized = this.analyzeCategorizedCommand("read", cmd, args, cwd, shellEnvironment, unmatchedGlobArguments, unresolvedPathArguments);
+        baseDecision = strongest(baseDecision, categorized.decision);
+        reasons.push(...categorized.reasons);
+        accesses.push(...categorized.accesses);
+        continue;
+      }
+
       if (INTERPRETERS.has(cmd)) {
         if (SHELL_INTERPRETERS.has(cmd)) {
           const cIndex = args.findIndex((arg) => arg === "-c" || /^-[^-]*c/.test(arg));
@@ -929,7 +1022,7 @@ export class GuardAnalyzer {
             baseDecision = strongest(baseDecision, "ask");
             reasons.push(`Unknown system command ${cmd} requires approval`);
           } else {
-            const categorized = this.analyzeCategorizedCommand(systemCategory, cmd, args, cwd, shellEnvironment);
+            const categorized = this.analyzeCategorizedCommand(systemCategory, cmd, args, cwd, shellEnvironment, unmatchedGlobArguments, unresolvedPathArguments);
             baseDecision = strongest(baseDecision, categorized.decision);
             reasons.push(...categorized.reasons);
             accesses.push(...categorized.accesses);
@@ -944,7 +1037,7 @@ export class GuardAnalyzer {
 
       const category = builtinCommandCategory(cmd);
       if (category) {
-        const categorized = this.analyzeCategorizedCommand(category, cmd, args, cwd, shellEnvironment);
+        const categorized = this.analyzeCategorizedCommand(category, cmd, args, cwd, shellEnvironment, unmatchedGlobArguments, unresolvedPathArguments);
         baseDecision = strongest(baseDecision, categorized.decision);
         reasons.push(...categorized.reasons);
         accesses.push(...categorized.accesses);
@@ -954,8 +1047,8 @@ export class GuardAnalyzer {
       }
 
       if (this.policy.isTrustedCommand(cmd, args)) {
-        for (const arg of args.filter((value) => looksLikePath(value) || /[*?\[]/.test(value) || pathExists(this.path(value, cwd)))) {
-          accesses.push({ path: this.path(arg, cwd), kind: "unknown", source: cmd, literal: isLiteralShellPath(arg), existed: pathExists(this.path(arg, cwd)) });
+        for (const arg of args.filter(pathLikeArgument)) {
+          accesses.push(argumentAccess(arg, "unknown", cmd));
         }
         continue;
       }
@@ -967,8 +1060,8 @@ export class GuardAnalyzer {
       reasons.push(unresolvedVariables.length
         ? `Executable variable ${[...new Set(unresolvedVariables)].join(", ")} cannot be resolved statically; runtime command requires approval`
         : `Unknown command ${cmd} requires approval`);
-      for (const arg of args.filter((value) => looksLikePath(value) || /[*?\[]/.test(value) || pathExists(this.path(value, cwd)))) {
-        accesses.push({ path: this.path(arg, cwd), kind: "unknown", source: cmd, literal: isLiteralShellPath(arg), existed: pathExists(this.path(arg, cwd)) });
+      for (const arg of args.filter(pathLikeArgument)) {
+        accesses.push(argumentAccess(arg, "unknown", cmd));
       }
     }
 
@@ -978,6 +1071,10 @@ export class GuardAnalyzer {
       all.findIndex((candidate) => candidate.name === item.name &&
         candidate.arguments.length === item.arguments.length &&
         candidate.arguments.every((value, argIndex) => value === item.arguments[argIndex])) === index);
+    if (pathExpansions.length) finalized.pathExpansions = pathExpansions.filter((item, index, all) =>
+      all.findIndex((candidate) => candidate.expression === item.expression &&
+        candidate.unresolved === item.unresolved && candidate.truncated === item.truncated &&
+        candidate.matches.length === item.matches.length && candidate.matches.every((value, matchIndex) => value === item.matches[matchIndex])) === index);
     return finalized;
   }
 
@@ -987,6 +1084,8 @@ export class GuardAnalyzer {
     args: string[],
     cwd: string,
     shellEnvironment: ShellEnvironment,
+    unmatchedGlobArguments = new Set<string>(),
+    unresolvedPathArguments = new Set<string>(),
   ): Analysis {
     if (category === "deny") return this.result("deny", [`Command ${command} is registered as prohibited`]);
     if (category === "allow") return this.result("allow", []);
@@ -1000,10 +1099,15 @@ export class GuardAnalyzer {
         : this.result("ask", [`${command} requires an execution target`]);
     }
 
-    const positional = args.filter((arg) => !arg.startsWith("-"));
-    const pathArguments = positional.filter((arg) => looksLikePath(arg) || /[*?\[]/.test(arg) || pathExists(this.path(arg, cwd)));
+    const positional = args.filter((arg) => !arg.startsWith("-") && !unresolvedPathArguments.has(arg));
+    const pathArguments = positional.filter((arg) => unmatchedGlobArguments.has(arg) || looksLikePath(arg) || pathExists(this.path(arg, cwd)));
+    const pathAccess = (arg: string, kind: AccessKind): PathAccess => {
+      const unmatched = unmatchedGlobArguments.has(arg);
+      const path = this.path(arg, cwd);
+      return { path, kind, source: command, literal: unmatched || isLiteralShellPath(arg), existed: unmatched ? false : pathExists(path) };
+    };
     if (category === "read") {
-      return this.finalize(pathArguments.map((arg) => ({ path: this.path(arg, cwd), kind: "read", source: command, literal: isLiteralShellPath(arg), existed: pathExists(this.path(arg, cwd)) })), [], [], []);
+      return this.finalize(pathArguments.map((arg) => pathAccess(arg, "read")), [], [], []);
     }
     if (category === "create") {
       const accesses: PathAccess[] = [];
@@ -1016,15 +1120,15 @@ export class GuardAnalyzer {
       return this.finalize(accesses, creations, [], []);
     }
     if (category === "edit") {
-      return this.finalize(pathArguments.map((arg) => ({ path: this.path(arg, cwd), kind: "edit", source: command, literal: isLiteralShellPath(arg), existed: pathExists(this.path(arg, cwd)) })), [], [], []);
+      return this.finalize(pathArguments.map((arg) => pathAccess(arg, "edit")), [], [], []);
     }
     if (category === "delete") {
-      const accesses = pathArguments.map((arg): PathAccess => ({ path: this.path(arg, cwd), kind: "delete", source: command, literal: !/[*?$`]/.test(arg) }));
+      const accesses = pathArguments.map((arg): PathAccess => pathAccess(arg, "delete"));
       const trashable = accesses.filter((item) => item.literal).map((item) => item.path);
       return this.finalize(accesses, [], trashable, []);
     }
     // Execute-category tools may run arbitrary nested programs or build logic.
-    const accesses = pathArguments.map((arg): PathAccess => ({ path: this.path(arg, cwd), kind: "execute", source: command, literal: isLiteralShellPath(arg), existed: pathExists(this.path(arg, cwd)) }));
+    const accesses = pathArguments.map((arg): PathAccess => pathAccess(arg, "execute"));
     const result = this.finalize(accesses, [], [], [`${command} may execute arbitrary logic`]);
     result.decision = strongest(result.decision, "ask");
     return result;

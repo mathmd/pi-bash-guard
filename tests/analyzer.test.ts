@@ -266,7 +266,8 @@ test("unowned deletion is denied and exposes literal trash targets", () => {
     assert.deepEqual(result.trashablePaths, [file]);
     const wildcard = f.analyzer.analyzeCommand("rm *.txt", f.workspace);
     assert.equal(wildcard.decision, "deny");
-    assert.deepEqual(wildcard.trashablePaths, []);
+    assert.deepEqual(wildcard.trashablePaths, [file]);
+    assert.deepEqual(wildcard.pathExpansions, [{ expression: "*.txt", matches: [file] }]);
   } finally { f.cleanup(); }
 });
 
@@ -449,6 +450,68 @@ test("known-missing literal paths do not require ownership", () => {
     assert.deepEqual(result.ownershipCandidates, []);
     assert.equal(result.accesses[0]?.existed, false);
     assert.equal(f.analyzer.analyzeCommand(`cat ${join(f.workspace, ".env")}`, f.workspace).decision, "deny");
+  } finally { f.cleanup(); }
+});
+
+test("shell globs and loop path variables expand to concrete prompt paths", () => {
+  const f = fixture();
+  try {
+    const luaRoot = join(f.workspace, ".config", "hypr", "lua");
+    mkdirSync(luaRoot, { recursive: true });
+    const main = join(f.workspace, ".config", "hypr", "hyprland.lua");
+    const first = join(luaRoot, "first.lua");
+    const second = join(luaRoot, "second.lua");
+    writeFileSync(main, "return {}\n");
+    writeFileSync(first, "return {}\n");
+    writeFileSync(second, "return {}\n");
+    const pattern = join(luaRoot, "*.lua");
+
+    const unknown = f.analyzer.analyzeCommand(`unknown-inspector ${pattern}`, f.workspace);
+    assert.equal(unknown.decision, "ask");
+    assert.deepEqual(unknown.accesses.map(({ path }) => path), [first, second]);
+    assert.deepEqual(unknown.ownershipCandidates, [
+      { path: first, required: "edit" },
+      { path: second, required: "edit" },
+    ]);
+    assert.deepEqual(unknown.pathExpansions, [{ expression: pattern, matches: [first, second] }]);
+    assert.equal(unknown.reasons.some((reason) => reason.includes("*.lua")), false);
+    const unmatched = f.analyzer.analyzeCommand(`unknown-inspector ${join(luaRoot, "missing-*.lua")}`, f.workspace);
+    assert.deepEqual(unmatched.ownershipCandidates, []);
+    assert.deepEqual(unmatched.pathExpansions, [{ expression: join(luaRoot, "missing-*.lua"), matches: [] }]);
+    const secret = join(f.workspace, ".env");
+    writeFileSync(secret, "TOKEN=test\n");
+    assert.equal(f.analyzer.analyzeCommand(`cat ${join(f.workspace, ".*")}`, f.workspace).decision, "deny");
+
+    const assigned = f.analyzer.analyzeCommandUnits(`dir=${luaRoot}; unknown-inspector "$dir"/*.lua`, f.workspace).at(-1)!;
+    assert.deepEqual(assigned.analysis.accesses.map(({ path }) => path), [first, second]);
+    assert.deepEqual(assigned.resolvedBindings, [{ name: "dir", value: luaRoot }]);
+
+    const loop = "then for file in .config/hypr/hyprland.lua .config/hypr/lua/*.lua; do lua -e 'assert(loadfile(arg[1]))' \"$file\"; done";
+    const requiring = f.analyzer.analyzeCommandUnits(loop, f.workspace).filter((unit) => unit.analysis.decision !== "allow");
+    assert.deepEqual(requiring.map((unit) => unit.resolvedBindings), [
+      [{ name: "file", value: main }],
+      [{ name: "file", value: first }],
+      [{ name: "file", value: second }],
+    ]);
+    assert.equal(requiring.every((unit) => unit.analysis.reasons.join(" ") === "Opaque lua inline code requires approval"), true);
+    assert.equal(requiring.every((unit) => unit.analysis.accesses.length === 0), true);
+
+    const unresolved = f.analyzer.analyzeCommand("unknown-inspector $runtime/*.lua", f.workspace);
+    assert.match(unresolved.reasons.join(" "), /Dynamic path cannot be resolved statically/);
+    assert.deepEqual(unresolved.ownershipCandidates, []);
+    assert.deepEqual(unresolved.pathExpansions, [{ expression: "$runtime/*.lua", matches: [], unresolved: true }]);
+  } finally { f.cleanup(); }
+});
+
+test("quoted Lua source is opaque code rather than a path or unknown command", () => {
+  const f = fixture();
+  try {
+    const result = f.analyzer.analyzeCommand("do lua -e 'assert(loadfile(arg[1]))' \"$file\"", f.workspace);
+    assert.equal(result.decision, "ask");
+    assert.deepEqual(result.reasons, ["Opaque lua inline code requires approval"]);
+    assert.deepEqual(result.accesses, []);
+    assert.deepEqual(result.ownershipCandidates, []);
+    assert.equal(f.analyzer.analyzeCommand("then luac -p .config/hypr/lua/*.lua", f.workspace).decision, "allow");
   } finally { f.cleanup(); }
 });
 

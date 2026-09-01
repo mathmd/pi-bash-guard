@@ -29,6 +29,10 @@ function mergeAnalyses(items: Analysis[]): Analysis {
       all.findIndex((other) => other.name === candidate.name &&
         other.arguments.length === candidate.arguments.length &&
         other.arguments.every((value, argIndex) => value === candidate.arguments[argIndex])) === index),
+    pathExpansions: [...(result.pathExpansions ?? []), ...(item.pathExpansions ?? [])].filter((expansion, index, all) =>
+      all.findIndex((other) => other.expression === expansion.expression &&
+        other.matches.length === expansion.matches.length && other.matches.every((value, matchIndex) => value === expansion.matches[matchIndex]) &&
+        other.unresolved === expansion.unresolved && other.truncated === expansion.truncated) === index),
   }), { decision: "allow", reasons: [], accesses: [], creationCandidates: [], trashablePaths: [], ownershipCandidates: [] });
 }
 

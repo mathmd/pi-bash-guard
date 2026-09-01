@@ -31,6 +31,13 @@ export interface PathAccess {
   existed?: boolean;
 }
 
+export interface PathExpansion {
+  expression: string;
+  matches: string[];
+  unresolved?: boolean;
+  truncated?: boolean;
+}
+
 export interface Analysis {
   decision: Decision;
   reasons: string[];
@@ -39,6 +46,7 @@ export interface Analysis {
   trashablePaths: string[];
   ownershipCandidates: Array<{ path: string; required: "edit" | "execute" | "full" }>;
   unknownCommands?: Array<{ name: string; arguments: string[] }>;
+  pathExpansions?: PathExpansion[];
 }
 
 export interface PolicyIssue {
