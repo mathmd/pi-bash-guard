@@ -363,6 +363,18 @@ export class GuardAnalyzer {
         else continue;
       }
       while (SHELL_PREFIX_WORDS.has(commandName(strings[index] ?? ""))) index++;
+      if (commandName(strings[index] ?? "") === "command") {
+        let optionIndex = index + 1;
+        let inspection = false;
+        let recognizedOptions = true;
+        while (strings[optionIndex]?.startsWith("-")) {
+          const option = strings[optionIndex++]!;
+          if (option === "--") break;
+          if (!/^-[pVv]+$/.test(option)) recognizedOptions = false;
+          if (/[Vv]/.test(option)) inspection = true;
+        }
+        if (recognizedOptions && inspection) continue;
+      }
       while (true) {
         const wrapper = commandName(strings[index] ?? "");
         if (wrapper === "timeout") {

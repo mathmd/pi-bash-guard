@@ -12,6 +12,7 @@ A local Pi extension that combines shell hazard detection with explicit path own
 - Secret reads, catastrophic commands, direct `.git` writes, and irreversible unowned deletion are denied.
 - Remote mutations and mutative Git/systemd commands always ask; filesystem searches, systemd inspection, HTTP GET/HEAD requests, common network diagnostics, and read-only IPP attribute queries do not.
 - Wrappers such as `timeout` inherit the classification of the command they run.
+- Shell `command -v`/`command -V` inspection is non-executing and does not treat the queried name as a command; other `command` forms still inherit the wrapped command’s classification.
 - Persistent shell assignments are resolved across compound commands; copy operations check concrete destination files rather than requiring ownership of the destination directory.
 - Path inference recognizes whole path arguments, not slash-containing code snippets, command strings, URLs, or other embedded text.
 - Headless sessions block anything that would ask.

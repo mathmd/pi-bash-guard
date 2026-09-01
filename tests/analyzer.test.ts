@@ -415,6 +415,22 @@ test("common shell grammar and builtins are recognized", () => {
   } finally { f.cleanup(); }
 });
 
+test("command existence inspection does not execute unresolved loop values", () => {
+  const f = fixture();
+  try {
+    assert.equal(f.analyzer.analyzeCommand(`command -v "$c"`, f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand(`command -pv "$c"`, f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand(`command -V -- "$c"`, f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand(`command "$c"`, f.workspace).decision, "ask");
+    assert.equal(f.analyzer.analyzeCommand(`command -p "$c"`, f.workspace).decision, "ask");
+
+    const loop = `for c in nix nh nixos-rebuild treefmt nixfmt shfmt statix deadnix shellcheck; do printf '%-16s' "$c"; command -v "$c" || true; done`;
+    const units = f.analyzer.analyzeCommandUnits(loop, f.workspace);
+    assert.equal(units.length > 0, true);
+    for (const unit of units) assert.equal(unit.analysis.decision, "allow", unit.command);
+  } finally { f.cleanup(); }
+});
+
 test("tee creates new files but asks before editing existing files", () => {
   const f = fixture();
   try {
