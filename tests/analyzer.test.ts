@@ -465,6 +465,32 @@ test("literal executable variables are analyzed and surfaced per candidate", () 
   } finally { f.cleanup(); }
 });
 
+test("non-shell inline interpreters are opaque rather than parsed as shell", () => {
+  const f = fixture();
+  try {
+    const grouped = `for p in "${f.workspace}"; do (cd "$p" && node -e 'console.log(\`cwd: \${process.cwd()}\`)'); done`;
+    const requiring = f.analyzer.analyzeCommandUnits(grouped, f.workspace)
+      .filter((unit) => unit.analysis.decision !== "allow");
+    assert.equal(requiring.length, 1);
+    assert.deepEqual(requiring[0]?.analysis.reasons, ["Opaque node inline code requires approval"]);
+
+    assert.equal(f.analyzer.analyzeCommand(`bash -lc "printf safe"`, f.workspace).decision, "allow");
+    for (const command of [
+      `node --eval 'console.log("safe")'`,
+      `python -c 'print("safe")'`,
+      `ruby -e 'puts "safe"'`,
+      `perl -e 'print "safe"'`,
+      `deno eval 'console.log("safe")'`,
+      `bun -e 'console.log("safe")'`,
+    ]) {
+      const result = f.analyzer.analyzeCommand(command, f.workspace);
+      assert.equal(result.decision, "ask", command);
+      assert.match(result.reasons.join(" "), /Opaque .* inline code requires approval/, command);
+      assert.doesNotMatch(result.reasons.join(" "), /Shell syntax could not be analyzed/, command);
+    }
+  } finally { f.cleanup(); }
+});
+
 test("tee creates new files but asks before editing existing files", () => {
   const f = fixture();
   try {

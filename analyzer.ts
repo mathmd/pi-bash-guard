@@ -12,6 +12,7 @@ type GlobToken = { op: "glob"; pattern: string };
 const CONTROL_OPS = new Set(["|", "|&", "&&", "||", ";", "&", "(", ")"]);
 const REDIRECT_OPS = new Set([">", ">>", "1>", "1>>", "2>", "2>>", "&>", "&>>", ">&", "<&", "<<<", "<"]);
 const INTERPRETERS = new Set(["bash", "sh", "zsh", "fish", "python", "python3", "node", "ruby", "perl", "deno", "bun"]);
+const SHELL_INTERPRETERS = new Set(["bash", "sh", "zsh", "fish"]);
 const GIT_READ_SUBCOMMANDS = new Set([
   "status", "diff", "diff-files", "diff-index", "diff-tree", "log", "show", "rev-parse", "ls-files", "grep",
   "blame", "describe", "shortlog", "for-each-ref", "show-ref", "ls-tree", "cat-file", "name-rev", "rev-list",
@@ -297,6 +298,22 @@ function referencedShellVariables(command: string): string[] {
 
 function isStaticallyResolvedValue(value: string): boolean {
   return !/\$(?:\(|\{|[A-Za-z_0-9])|`/.test(value);
+}
+
+function hasOpaqueInlineCode(command: string, args: string[]): boolean {
+  if ((command === "deno" || command === "bun") && args.find((arg) => !arg.startsWith("-")) === "eval") return true;
+  const valueFlags: Record<string, Set<string>> = {
+    node: new Set(["-e", "--eval", "-p", "--print"]),
+    python: new Set(["-c"]),
+    python3: new Set(["-c"]),
+    ruby: new Set(["-e"]),
+    perl: new Set(["-e", "-E"]),
+    bun: new Set(["-e", "--eval", "-p", "--print"]),
+  };
+  const flags = valueFlags[command];
+  if (!flags) return false;
+  return args.some((arg) => flags.has(arg) ||
+    [...flags].some((flag) => flag.startsWith("--") ? arg.startsWith(`${flag}=`) : arg.startsWith(flag) && arg.length > flag.length));
 }
 
 function recursiveCopyTargets(source: string, destination: string, limit = 10_000): string[] {
@@ -660,25 +677,35 @@ export class GuardAnalyzer {
         continue;
       }
 
-      if ((cmd === "sed" && args.some((arg) => arg === "-i" || arg.startsWith("-i"))) ||
-          (cmd === "perl" && args.some((arg) => arg.includes("i")))) {
+      const perlInPlace = cmd === "perl" && args.some((arg) => /^-[^-]*i/.test(arg) || arg === "--in-place" || arg.startsWith("--in-place="));
+      if ((cmd === "sed" && args.some((arg) => arg === "-i" || arg.startsWith("-i"))) || perlInPlace) {
         for (const value of args.filter((arg) => !arg.startsWith("-") && looksLikePath(arg))) {
           accesses.push({ path: this.path(value, cwd), kind: "edit", source: cmd, literal: true, existed: pathExists(this.path(value, cwd)) });
         }
-        continue;
+        if (cmd === "sed") continue;
       }
 
       if (INTERPRETERS.has(cmd)) {
-        const cIndex = args.findIndex((arg) =>
-          arg === "-c" || arg === "-e" || arg === "--eval" ||
-          (["bash", "sh", "zsh", "fish"].includes(cmd) && /^-[^-]*c/.test(arg)));
-        if (cIndex >= 0 && args[cIndex + 1]) {
-          const nested = this.analyzeCommand(args[cIndex + 1], cwd, shellEnvironment);
-          baseDecision = strongest(baseDecision, nested.decision);
-          reasons.push(...nested.reasons);
-          accesses.push(...nested.accesses);
-          creations.push(...nested.creationCandidates);
-          trashable.push(...nested.trashablePaths);
+        if (SHELL_INTERPRETERS.has(cmd)) {
+          const cIndex = args.findIndex((arg) => arg === "-c" || /^-[^-]*c/.test(arg));
+          if (cIndex >= 0) {
+            const source = args[cIndex + 1];
+            if (source) {
+              const nested = this.analyzeCommand(source, cwd, shellEnvironment);
+              baseDecision = strongest(baseDecision, nested.decision);
+              reasons.push(...nested.reasons);
+              accesses.push(...nested.accesses);
+              creations.push(...nested.creationCandidates);
+              trashable.push(...nested.trashablePaths);
+            } else {
+              baseDecision = strongest(baseDecision, "ask");
+              reasons.push(`Shell interpreter ${cmd} has an unresolved inline command`);
+            }
+            continue;
+          }
+        } else if (hasOpaqueInlineCode(cmd, args)) {
+          baseDecision = strongest(baseDecision, "ask");
+          reasons.push(`Opaque ${cmd} inline code requires approval`);
           continue;
         }
         const script = args.find((arg) => !arg.startsWith("-"));
