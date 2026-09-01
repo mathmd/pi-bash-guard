@@ -4,7 +4,7 @@ import { dirname } from "node:path";
 import { quote as shellQuote } from "shell-quote";
 import type { ExtensionAPI, ToolCallEvent, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
-import { GuardAnalyzer } from "./analyzer.ts";
+import { GuardAnalyzer, type CommandAnalysisUnit } from "./analyzer.ts";
 import { canonicalPath, containsGitMetadata, pathExists, resolvePath } from "./path-utils.ts";
 import { PolicyStore } from "./policy.ts";
 import type { Analysis } from "./types.ts";
@@ -54,6 +54,13 @@ function subjectFor(event: ToolCallEvent): string {
   return `Tool: ${event.toolName}\nInput contains protected or unowned path access.`;
 }
 
+function executableBindingDetails(unit: CommandAnalysisUnit): string {
+  if (!unit.executableBindings?.length) return "";
+  const bindings = unit.executableBindings.map(({ name, value }) =>
+    `$${name} = ${value === undefined ? "<unresolved at analysis time>" : JSON.stringify(value)}`);
+  return `\n\nExecutable variable${bindings.length === 1 ? "" : "s"}:\n${bindings.join("\n")}`;
+}
+
 export default function bashGuard(pi: ExtensionAPI): void {
   let policy: PolicyStore | undefined;
   let analyzer: GuardAnalyzer | undefined;
@@ -101,7 +108,7 @@ export default function bashGuard(pi: ExtensionAPI): void {
       const combined = units.reduce((decision, unit) => strongest(decision, unit.analysis.decision), "allow" as Analysis["decision"]);
       promptItems = strongest(combined, analysis.decision) === combined
         ? units.map((unit, index) => ({
-            subject: `Command requiring permission (${index + 1}/${units.length}, shell order):\n${unit.command}`,
+            subject: `Command requiring permission (${index + 1}/${units.length}, shell order):\n${unit.command}${executableBindingDetails(unit)}`,
             analysis: unit.analysis,
             unitIndex: unit.unitIndex,
           }))

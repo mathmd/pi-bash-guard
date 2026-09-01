@@ -431,6 +431,40 @@ test("command existence inspection does not execute unresolved loop values", () 
   } finally { f.cleanup(); }
 });
 
+test("literal executable variables are analyzed and surfaced per candidate", () => {
+  const f = fixture();
+  try {
+    const loop = `for c in echo unknown-one unknown-two; do "$c" --version; done`;
+    const requiring = f.analyzer.analyzeCommandUnits(loop, f.workspace)
+      .filter((unit) => unit.analysis.decision !== "allow");
+    assert.deepEqual(requiring.map((unit) => unit.executableBindings), [
+      [{ name: "c", value: "unknown-one" }],
+      [{ name: "c", value: "unknown-two" }],
+    ]);
+    assert.match(requiring[0]!.analysis.reasons.join(" "), /Unknown command unknown-one/);
+    assert.match(requiring[1]!.analysis.reasons.join(" "), /Unknown command unknown-two/);
+
+    const assigned = f.analyzer.analyzeCommandUnits(`c=assigned-tool; "$c"`, f.workspace)
+      .filter((unit) => unit.analysis.decision !== "allow");
+    assert.deepEqual(assigned[0]?.executableBindings, [{ name: "c", value: "assigned-tool" }]);
+
+    const dynamic = f.analyzer.analyzeCommandUnits(`"$runtime_tool" --version`, f.workspace)
+      .filter((unit) => unit.analysis.decision !== "allow");
+    assert.deepEqual(dynamic[0]?.executableBindings, [{ name: "runtime_tool" }]);
+    assert.match(dynamic[0]?.analysis.reasons.join(" ") ?? "", /cannot be resolved statically/);
+
+    const dynamicAssignment = f.analyzer.analyzeCommandUnits(`c=$runtime_tool; "$c"`, f.workspace)
+      .filter((unit) => unit.analysis.decision !== "allow");
+    assert.deepEqual(dynamicAssignment[0]?.executableBindings, [{ name: "c" }]);
+    assert.match(dynamicAssignment[0]?.analysis.reasons.join(" ") ?? "", /\$c cannot be resolved statically/);
+
+    const expandedLoop = f.analyzer.analyzeCommandUnits(`tools="one two"; for c in $tools; do "$c"; done`, f.workspace)
+      .filter((unit) => unit.analysis.decision !== "allow");
+    assert.deepEqual(expandedLoop[0]?.executableBindings, [{ name: "c" }]);
+    assert.match(expandedLoop[0]?.analysis.reasons.join(" ") ?? "", /\$c cannot be resolved statically/);
+  } finally { f.cleanup(); }
+});
+
 test("tee creates new files but asks before editing existing files", () => {
   const f = fixture();
   try {

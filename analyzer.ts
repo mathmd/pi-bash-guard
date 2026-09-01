@@ -193,6 +193,7 @@ function splitSegments(tokens: ParseToken[]): ParseToken[][] {
 export interface CommandAnalysisUnit {
   command: string;
   analysis: Analysis;
+  executableBindings?: Array<{ name: string; value?: string }>;
 }
 
 /** Split top-level shell commands in lexical execution order without changing their source text. */
@@ -262,6 +263,42 @@ function persistentAssignmentUpdates(command: string, environment: ShellEnvironm
   return updates;
 }
 
+interface StaticLoopBinding { name: string; values: string[]; }
+
+function staticLoopBinding(command: string, environment: ShellEnvironment, home: string): StaticLoopBinding | undefined {
+  if (referencedShellVariables(command).some((name) => name !== "HOME")) return undefined;
+  let tokens: ParseToken[];
+  try {
+    tokens = shellParse(command.replace(/\\\r?\n/g, " "), shellEnvironmentResolver(environment, home)) as ParseToken[];
+  } catch {
+    return undefined;
+  }
+  if (!tokens.every((token): token is string => typeof token === "string")) return undefined;
+  if (tokens[0] !== "for" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(tokens[1] ?? "") || tokens[2] !== "in") return undefined;
+  const values = tokens.slice(3);
+  if (!values.length || values.length > 128 || values.some((value) => /[{}]|\$[({A-Za-z_0-9]/.test(value))) return undefined;
+  return { name: tokens[1]!, values: [...new Set(values)] };
+}
+
+function referencedShellVariables(command: string): string[] {
+  const names = new Set<string>();
+  try {
+    shellParse(command, (name) => {
+      names.add(name);
+      return `$${name}`;
+    });
+  } catch {
+    for (const match of command.matchAll(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g)) {
+      names.add(match[1] ?? match[2]!);
+    }
+  }
+  return [...names];
+}
+
+function isStaticallyResolvedValue(value: string): boolean {
+  return !/\$(?:\(|\{|[A-Za-z_0-9])|`/.test(value);
+}
+
 function recursiveCopyTargets(source: string, destination: string, limit = 10_000): string[] {
   const targets: string[] = [];
   const walk = (sourcePath: string, destinationPath: string): void => {
@@ -293,14 +330,93 @@ export class GuardAnalyzer {
     return canonicalPath(resolvePath(raw, cwd, this.policy.home));
   }
 
+  private executableVariableNames(command: string, cwd: string, environment: ShellEnvironment): string[] {
+    const executableNames: string[] = [];
+    for (const name of referencedShellVariables(command)) {
+      const marker = `__bash_guard_variable_${name}__`;
+      const probe = this.analyzeCommand(command, cwd, { ...environment, [name]: marker });
+      const isCommand = probe.reasons.some((reason) => reason.startsWith("Unknown command ") && reason.includes(marker));
+      const isExecutionTarget = probe.accesses.some((access) => access.kind === "execute" &&
+        (access.source?.includes(marker) || access.path.includes(marker)));
+      if (isCommand || isExecutionTarget) executableNames.push(name);
+    }
+    return executableNames;
+  }
+
   analyzeCommandUnits(command: string, cwd: string): CommandAnalysisUnit[] {
     const environment: ShellEnvironment = {};
-    return splitShellCommandUnits(command).map((unit) => {
-      const analysis = this.analyzeCommand(unit, cwd, environment);
+    const candidates = new Map<string, string[]>();
+    const loops: Array<{ name: string; values: string[]; previous?: string[] }> = [];
+    const results: CommandAnalysisUnit[] = [];
+    for (const unit of splitShellCommandUnits(command)) {
+      const loop = staticLoopBinding(unit, environment, this.policy.home);
+      if (loop) {
+        results.push({ command: unit, analysis: this.analyzeCommand(unit, cwd, environment) });
+        loops.push({ name: loop.name, values: loop.values, previous: candidates.get(loop.name) });
+        candidates.set(loop.name, loop.values);
+        continue;
+      }
+
+      const executableNames = this.executableVariableNames(unit, cwd, environment);
+      let contexts: Array<{ environment: ShellEnvironment; bindings: Array<{ name: string; value?: string }> }> = [
+        { environment: { ...environment }, bindings: [] },
+      ];
+      let expansionLimited = false;
+      for (const name of executableNames) {
+        const assigned = environment[name];
+        const values: Array<string | undefined> = candidates.get(name) ??
+          (assigned !== undefined && isStaticallyResolvedValue(assigned)
+            ? [assigned]
+            : name === "HOME" ? [this.policy.home] : [undefined]);
+        if (contexts.length * values.length > 128) {
+          expansionLimited = true;
+          const unresolvedEnvironment = { ...environment };
+          for (const variable of executableNames) delete unresolvedEnvironment[variable];
+          contexts = [{
+            environment: unresolvedEnvironment,
+            bindings: executableNames.map((variable) => ({ name: variable })),
+          }];
+          break;
+        }
+        contexts = contexts.flatMap((context) => values.map((value) => {
+          const resolvedEnvironment = { ...context.environment };
+          if (value === undefined) delete resolvedEnvironment[name];
+          else resolvedEnvironment[name] = value;
+          return {
+            environment: resolvedEnvironment,
+            bindings: [...context.bindings, { name, ...(value === undefined ? {} : { value }) }],
+          };
+        }));
+      }
+
+      for (const context of contexts) {
+        const analysis = this.analyzeCommand(unit, cwd, context.environment);
+        if (expansionLimited) {
+          analysis.decision = strongest(analysis.decision, "ask");
+          analysis.reasons.push("Executable variable has more than 128 static candidate combinations and cannot be expanded safely");
+        }
+        results.push({
+          command: unit,
+          analysis,
+          ...(context.bindings.length ? { executableBindings: context.bindings } : {}),
+        });
+      }
+
       const updates = persistentAssignmentUpdates(unit, environment, this.policy.home);
-      if (updates) Object.assign(environment, updates);
-      return { command: unit, analysis };
-    });
+      if (updates) {
+        Object.assign(environment, updates);
+        for (const name of Object.keys(updates)) candidates.delete(name);
+      }
+      if (/^done(?:\s|$)/.test(unit.trim())) {
+        const closed = loops.pop();
+        if (closed) {
+          environment[closed.name] = closed.values.at(-1)!;
+          if (closed.previous) candidates.set(closed.name, closed.previous);
+          else candidates.delete(closed.name);
+        }
+      }
+    }
+    return results;
   }
 
   analyzePathAccess(path: string, kind: AccessKind, cwd: string, source: string, literal = true): Analysis {
@@ -610,7 +726,11 @@ export class GuardAnalyzer {
       }
 
       baseDecision = strongest(baseDecision, "ask");
-      reasons.push(`Unknown command ${cmd} requires approval`);
+      const unresolvedVariables = [...executableRaw.matchAll(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g)]
+        .map((match) => `$${match[1] ?? match[2]}`);
+      reasons.push(unresolvedVariables.length
+        ? `Executable variable ${[...new Set(unresolvedVariables)].join(", ")} cannot be resolved statically; runtime command requires approval`
+        : `Unknown command ${cmd} requires approval`);
       for (const arg of args.filter((value) => looksLikePath(value) || /[*?\[]/.test(value) || pathExists(this.path(value, cwd)))) {
         accesses.push({ path: this.path(arg, cwd), kind: "unknown", source: cmd, literal: true });
       }
