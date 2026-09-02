@@ -378,13 +378,110 @@ test("Git read operations allow, mutations ask, and forced push denies", () => {
   } finally { f.cleanup(); }
 });
 
-test("catastrophic content in a script is denied even with full ownership", () => {
+test("catastrophic screening distinguishes executable commands from fixture data", () => {
   const f = fixture();
   try {
-    const script = join(f.workspace, "bad.sh");
-    writeFileSync(script, "#!/bin/sh\nmkfs /dev/example\n");
-    f.policy.save("local", { version: 3, ownership: { edit: [], execute: [], full: ["bad.sh"] }, secrets: [], commands: { include: [], exclude: [] } });
-    assert.equal(f.analyzer.analyzeCommand(`bash ${script}`, f.workspace).decision, "deny");
+    const badShell = join(f.workspace, "bad.sh");
+    const dataShell = join(f.workspace, "data.sh");
+    const safeTest = join(f.workspace, "safe.test.ts");
+    const dangerousTest = join(f.workspace, "dangerous.test.ts");
+    writeFileSync(badShell, "#!/bin/sh\nmkfs /dev/example\n");
+    writeFileSync(dataShell, "#!/bin/sh\nprintf '%s\\n' 'mkfs /dev/example'\n");
+    writeFileSync(safeTest, [
+      'import assert from "node:assert/strict";',
+      'import { execSync } from "node:child_process";',
+      'const fixture = "git push --force origin main";',
+      'execSync(`printf "%s\\n" "${fixture}"`);',
+      'assert.equal(fixture.includes("--force"), true);',
+    ].join("\n"));
+    f.policy.save("local", {
+      version: 3,
+      ownership: { edit: [], execute: [], full: ["bad.sh", "data.sh", "*.test.ts"] },
+      secrets: [],
+      commands: { include: [], exclude: [] },
+    });
+
+    for (const command of [
+      "dd if=input of=/dev/example",
+      "shutdown now",
+      "env MODE=test git push --force origin main",
+      "terraform destroy -auto-approve",
+      "rm /",
+      ":(){ :|:& };:",
+    ]) assert.equal(f.analyzer.analyzeCommand(command, f.workspace).decision, "deny", command);
+    assert.equal(f.analyzer.analyzeCommand(`bash ${badShell}`, f.workspace).decision, "deny");
+    assert.equal(f.analyzer.analyzeCommand(`bash ${dataShell}`, f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand(`printf '%s\\n' 'git push --force origin main'`, f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand(`printf '%s\\n' ':(){ :|:& };:'`, f.workspace).decision, "allow");
+    const inlineData = f.analyzer.analyzeCommand(`node -e 'console.log("git push --force origin main")'`, f.workspace);
+    assert.equal(inlineData.decision, "ask");
+    assert.deepEqual(inlineData.reasons, ["Opaque node inline code requires approval"]);
+    assert.match(
+      f.analyzer.analyzeCommand(`node --test --eval 'console.log("safe")'`, f.workspace).reasons.join(" "),
+      /Opaque node inline code/,
+    );
+    const unresolvedTests = f.analyzer.analyzeCommand('node --test "$runtime"', f.workspace);
+    assert.equal(unresolvedTests.decision, "ask");
+    assert.match(unresolvedTests.reasons.join(" "), /could not be discovered safely/);
+
+    const explicitTests = f.analyzer.analyzeCommand(`node --test ${safeTest}`, f.workspace);
+    assert.equal(explicitTests.decision, "allow");
+    assert.deepEqual(explicitTests.accesses.map((access) => access.path), [safeTest]);
+    assert.equal(f.analyzer.analyzeCommand("node --test", f.workspace).decision, "allow");
+    const afterCd = f.analyzer.analyzeCommandUnits(`cd ${f.workspace} && node --test safe.test.ts`, f.root);
+    assert.equal(afterCd.at(-1)?.analysis.decision, "allow");
+    assert.deepEqual(afterCd.at(-1)?.analysis.accesses.map((access) => access.path), [safeTest]);
+
+    writeFileSync(dangerousTest, [
+      'import { execSync } from "node:child_process";',
+      'execSync("git push --force origin main");',
+    ].join("\n"));
+    const dangerous = f.analyzer.analyzeCommand(`node --test ${dangerousTest}`, f.workspace);
+    assert.equal(dangerous.decision, "deny");
+    assert.match(dangerous.reasons.join(" "), /Destructive Git operation|forced remote history rewrite/);
+
+    const invalidTest = join(f.workspace, "invalid.test.ts");
+    writeFileSync(invalidTest, "const broken = ;\n");
+    const invalid = f.analyzer.analyzeCommand(`node --test ${invalidTest}`, f.workspace);
+    assert.equal(invalid.decision, "ask");
+    assert.match(invalid.reasons.join(" "), /could not be inspected safely/);
+  } finally { f.cleanup(); }
+});
+
+test("npm test analyzes local lifecycle scripts and nested Node tests", () => {
+  const f = fixture();
+  try {
+    const safeTest = join(f.workspace, "npm-safe.test.ts");
+    const otherTest = join(f.workspace, "npm-other.test.ts");
+    const packageJson = join(f.workspace, "package.json");
+    writeFileSync(safeTest, 'const fixture = "git push --force origin main";\n');
+    writeFileSync(otherTest, 'const fixture = "shutdown now";\n');
+    writeFileSync(packageJson, JSON.stringify({ scripts: {
+      pretest: "printf pre",
+      test: "node --test *.test.ts",
+      posttest: "printf post",
+    } }));
+    f.policy.save("local", {
+      version: 3,
+      ownership: { edit: [], execute: [], full: ["*.test.ts"] },
+      secrets: [],
+      commands: { include: [], exclude: [] },
+    });
+
+    const safe = f.analyzer.analyzeCommand("npm test", f.workspace);
+    assert.equal(safe.decision, "allow");
+    assert.deepEqual(safe.accesses.map((access) => access.path), [packageJson, otherTest, safeTest]);
+    assert.equal(f.analyzer.analyzeCommand(`npm test -- 'git push --force origin main'`, f.workspace).decision, "allow");
+
+    writeFileSync(packageJson, JSON.stringify({ scripts: { test: "git push --force origin main" } }));
+    const dangerous = f.analyzer.analyzeCommand("npm run test", f.workspace);
+    assert.equal(dangerous.decision, "deny");
+    assert.match(dangerous.reasons.join(" "), /Destructive Git operation/);
+
+    writeFileSync(packageJson, JSON.stringify({ scripts: { test: "npm test" } }));
+    const recursive = f.analyzer.analyzeCommand("npm test", f.workspace);
+    assert.equal(recursive.decision, "ask");
+    assert.match(recursive.reasons.join(" "), /Recursive npm script/);
   } finally { f.cleanup(); }
 });
 
@@ -421,6 +518,8 @@ test("find mutation is not mistaken for a read-only search", () => {
     assert.equal(f.analyzer.analyzeCommand(`find ${f.workspace} -printf '%p\\n'`, f.workspace).decision, "allow");
     assert.equal(f.analyzer.analyzeCommand("find . -delete", f.workspace).decision, "deny");
     assert.equal(f.analyzer.analyzeCommand("find . -exec echo {} ;", f.workspace).decision, "ask");
+    assert.equal(f.analyzer.analyzeCommand("find . -exec rm / \\;", f.workspace).decision, "deny");
+    assert.equal(f.analyzer.analyzeCommand("xargs -n 1 git push --force origin main", f.workspace).decision, "deny");
     assert.equal(f.analyzer.analyzeCommand("find . -ok echo {} ;", f.workspace).decision, "ask");
   } finally { f.cleanup(); }
 });

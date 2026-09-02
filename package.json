@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
+    "@babel/parser": "^7.29.8",
     "shell-quote": "^1.8.3"
   },
   "scripts": {

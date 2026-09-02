@@ -1,10 +1,14 @@
 import { createHash } from "node:crypto";
-import { globSync, lstatSync, readFileSync, readdirSync } from "node:fs";
+import { globSync, lstatSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, dirname, join, relative } from "node:path";
-import { parse as shellParse, type ParseToken } from "shell-quote";
+import { parse as shellParse, quote as shellQuote, type ParseToken } from "shell-quote";
 import type { AccessKind, Analysis, CommandCategory, Decision, PathAccess, PathExpansion } from "./types.ts";
 import { strongest } from "./types.ts";
+import { catastrophicInvocation, catastrophicTextReason, containsUnquotedForkBomb } from "./catastrophic-screening.ts";
 import { canonicalPath, containsGitMetadata, expandHome, isWithin, looksLikePath, pathExists, pathIsDirectory, resolvePath } from "./path-utils.ts";
+import { javascriptExecutions } from "./javascript-screening.ts";
+import { selectNodeTestFiles } from "./node-test-selection.ts";
+import { selectNpmScripts } from "./npm-scripts.ts";
 import type { PolicyStore } from "./policy.ts";
 import { builtinCommandCategory, SHELL_CLOSING_WORDS, SHELL_HEADER_WORDS, SHELL_PREFIX_WORDS } from "./command-catalog.ts";
 
@@ -240,18 +244,24 @@ function classifyCurl(args: string[]): CurlClassification {
   return { readOnly: safeMethod && !mutativePayload && !opaqueConfig && (!hasData || queryMode), outputs };
 }
 
-const CATASTROPHIC: Array<[RegExp, string]> = [
-  [/\b(?:mkfs(?:\.\w+)?|newfs_\w+|wipefs)\b/, "filesystem formatting or signature destruction"],
-  [/\bdd\b[^\n]*\bof=\/dev\//, "raw device write"],
-  [/\b(?:parted|fdisk|gdisk|sgdisk)\b/, "partition-table mutation"],
-  [/\b(?:shutdown|reboot|halt|poweroff)\b/, "system power operation"],
-  [/:\(\)\s*\{\s*:\|:&\s*\}\s*;\s*:/, "fork bomb"],
-  [/\bgit\s+push\b[^\n]*(?:--force(?:-with-lease)?|-f)(?:\s|$)/, "forced remote history rewrite"],
-  [/\bgit\s+reset\b[^\n]*--hard\b/, "destructive Git reset"],
-  [/\bgit\s+clean\b[^\n]*-[A-Za-z]*f/, "destructive removal of untracked files"],
-  [/\bterraform\s+destroy\b|\btofu\s+destroy\b/, "infrastructure teardown"],
-  [/\b(?:rm|rmdir)\b[^\n]*(?:\s|^)(?:\/|~)(?:\s|$)/, "deletion of a filesystem root or home"],
-];
+
+const XARGS_VALUE_OPTIONS = new Set([
+  "-a", "--arg-file", "-d", "--delimiter", "-E", "--eof", "-I", "--replace",
+  "-L", "--max-lines", "-n", "--max-args", "-P", "--max-procs", "-s", "--max-chars",
+  "--process-slot-var",
+]);
+
+function xargsNestedCommand(args: string[]): string[] | undefined {
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!;
+    if (arg === "--") return args.slice(index + 1);
+    if (XARGS_VALUE_OPTIONS.has(arg)) { index++; continue; }
+    if (arg.startsWith("--") && arg.includes("=")) continue;
+    if (/^-[dEILnPs].+/.test(arg) || arg.startsWith("-")) continue;
+    return args.slice(index);
+  }
+  return undefined;
+}
 
 function isOp(token: ParseToken): token is OpToken {
   return typeof token === "object" && token !== null && "op" in token;
@@ -265,9 +275,6 @@ function commandName(value: string): string {
   return basename(value);
 }
 
-function cleanArgs(values: string[]): string[] {
-  return values.filter((value) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(value));
-}
 
 function isLiteralShellPath(value: string): boolean {
   return !/\$(?:[$?!#*@0-9-]|\(|\{|[A-Za-z_])|`/.test(value);
@@ -292,18 +299,22 @@ export interface CommandAnalysisUnit {
   resolvedBindings?: Array<{ name: string; value: string; symbolic?: string }>;
 }
 
-/** Split top-level shell commands in lexical execution order without changing their source text. */
-export function splitShellCommandUnits(command: string): string[] {
-  const units: string[] = [];
+interface ShellCommandEntry {
+  command: string;
+  separatorAfter?: string;
+}
+
+function splitShellCommandEntries(command: string): ShellCommandEntry[] {
+  const entries: ShellCommandEntry[] = [];
   let start = 0;
   let quote: "'" | '"' | "`" | undefined;
   let escaped = false;
   let parentheses = 0;
   let comment = false;
 
-  const push = (end: number) => {
+  const push = (end: number, separatorAfter?: string) => {
     const value = command.slice(start, end).trim();
-    if (value) units.push(value);
+    if (value) entries.push({ command: value, ...(separatorAfter ? { separatorAfter } : {}) });
   };
 
   for (let index = 0; index < command.length; index++) {
@@ -326,14 +337,19 @@ export function splitShellCommandUnits(command: string): string[] {
 
     const two = command.slice(index, index + 2);
     if (char === "&" && ([">", "<"].includes(command[index - 1] ?? "") || command[index + 1] === ">")) continue;
-    const operatorLength = ["&&", "||", "|&", ";;"].includes(two) ? 2 : [";", "|", "&", "\n"].includes(char) ? 1 : 0;
-    if (!operatorLength) continue;
-    push(index);
-    index += operatorLength - 1;
+    const separator = ["&&", "||", "|&", ";;"].includes(two) ? two : [";", "|", "&", "\n"].includes(char) ? char : undefined;
+    if (!separator) continue;
+    push(index, separator);
+    index += separator.length - 1;
     start = index + 1;
   }
   push(command.length);
-  return units.length ? units : [command.trim()].filter(Boolean);
+  return entries.length ? entries : [command.trim()].filter(Boolean).map((value) => ({ command: value }));
+}
+
+/** Split top-level shell commands in lexical execution order without changing their source text. */
+export function splitShellCommandUnits(command: string): string[] {
+  return splitShellCommandEntries(command).map((entry) => entry.command);
 }
 
 type ShellEnvironment = Record<string, string>;
@@ -348,6 +364,25 @@ type GeneratedPathEnvironment = Map<string, GeneratedPathBinding>;
 
 function shellEnvironmentResolver(environment: ShellEnvironment, home: string): (key: string) => string {
   return (key) => environment[key] ?? (key === "HOME" ? home : `$${key}`);
+}
+
+function staticCdDirectory(command: string, cwd: string, home: string, environment: ShellEnvironment): string | undefined {
+  const masked = maskCommandSubstitutions(command);
+  if (masked.sources.length) return undefined;
+  let tokens: ParseToken[];
+  try { tokens = shellParse(masked.command, shellEnvironmentResolver(environment, home)) as ParseToken[]; }
+  catch { return undefined; }
+  if (!tokens.every((token): token is string => typeof token === "string")) return undefined;
+  let index = 0;
+  while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index] ?? "")) index++;
+  if (commandName(tokens[index] ?? "") !== "cd") return undefined;
+  index++;
+  while (["-L", "-P", "-e", "-@"].includes(tokens[index] ?? "")) index++;
+  if (tokens[index] === "--") index++;
+  const target = tokens[index] ?? home;
+  if (target === "-" || tokens[index + 1] !== undefined || !isStaticallyResolvedValue(target)) return undefined;
+  const path = canonicalPath(resolvePath(target, cwd, home));
+  return pathIsDirectory(path) ? path : undefined;
 }
 
 function persistentAssignmentUpdates(command: string, environment: ShellEnvironment, home: string): ShellEnvironment | undefined {
@@ -646,9 +681,27 @@ function recursiveCopyTargets(source: string, destination: string, limit = 10_00
     return [destination];
   }
 }
+type ScriptLanguage = "shell" | "javascript" | "other";
+
+interface ScriptScreeningResult {
+  decision: "ask" | "deny";
+  reason: string;
+}
+
+function scriptLanguage(path: string, interpreter: string | undefined, source: string): ScriptLanguage {
+  if (interpreter && SHELL_INTERPRETERS.has(interpreter)) return "shell";
+  if (interpreter && ["node", "deno", "bun"].includes(interpreter)) return "javascript";
+  if (/\.(?:[cm]?[jt]s)$/i.test(path)) return "javascript";
+  const shebang = source.split("\n", 1)[0] ?? "";
+  if (/^#!.*\b(?:ba|z|fi)?sh\b/.test(shebang)) return "shell";
+  if (/^#!.*\b(?:node|deno|bun)\b/.test(shebang)) return "javascript";
+  return "other";
+}
 
 export class GuardAnalyzer {
   private readonly policy: PolicyStore;
+  private readonly screeningPaths = new Set<string>();
+  private readonly npmScriptStack = new Set<string>();
 
   constructor(policy: PolicyStore) {
     this.policy = policy;
@@ -677,19 +730,22 @@ export class GuardAnalyzer {
     const generatedPaths: GeneratedPathEnvironment = new Map();
     const loops: Array<{ name: string; values: string[]; previous?: string[] }> = [];
     const results: CommandAnalysisUnit[] = [];
-    for (const unit of splitShellCommandUnits(command)) {
+    let workingDirectory = cwd;
+    for (const entry of splitShellCommandEntries(command)) {
+      const unit = entry.command;
+      const unitCwd = workingDirectory;
       const resultStart = results.length;
-      const generated = generatedPathAssignment(unit, cwd, this.policy.home, environment);
-      const loop = staticLoopBinding(unit, environment, this.policy.home, cwd);
+      const generated = generatedPathAssignment(unit, unitCwd, this.policy.home, environment);
+      const loop = staticLoopBinding(unit, environment, this.policy.home, unitCwd);
       if (loop) {
-        results.push({ command: unit, analysis: this.analyzeCommand(unit, cwd, environment, generatedPaths) });
+        results.push({ command: unit, analysis: this.analyzeCommand(unit, unitCwd, environment, generatedPaths) });
         loops.push({ name: loop.name, values: loop.values, previous: candidates.get(loop.name) });
         candidates.set(loop.name, loop.values);
         continue;
       }
 
       const referencedNames = referencedShellVariables(unit);
-      const executableNames = this.executableVariableNames(unit, cwd, environment, generatedPaths);
+      const executableNames = this.executableVariableNames(unit, unitCwd, environment, generatedPaths);
       const expansionNames = [...new Set([...executableNames, ...referencedNames.filter((name) => candidates.has(name))])];
       let contexts: Array<{ environment: ShellEnvironment; bindings: Array<{ name: string; value?: string }> }> = [
         { environment: { ...environment }, bindings: [] },
@@ -723,7 +779,7 @@ export class GuardAnalyzer {
       }
 
       for (const context of contexts) {
-        const analysis = this.analyzeCommand(unit, cwd, context.environment, generatedPaths);
+        const analysis = this.analyzeCommand(unit, unitCwd, context.environment, generatedPaths);
         if (generated) {
           const safety = this.finalize([], [generated.binding.path], [], [], generatedPaths);
           analysis.decision = strongest(analysis.decision, safety.decision);
@@ -772,7 +828,7 @@ export class GuardAnalyzer {
         Object.assign(environment, updates);
         for (const [name, value] of Object.entries(updates)) {
           candidates.delete(name);
-          const special = specialParameterPathBinding(name, value, cwd, this.policy.home);
+          const special = specialParameterPathBinding(name, value, unitCwd, this.policy.home);
           if (special) {
             environment[name] = special.path;
             generatedPaths.set(name, special);
@@ -786,6 +842,9 @@ export class GuardAnalyzer {
           if (closed.previous) candidates.set(closed.name, closed.previous);
           else candidates.delete(closed.name);
         }
+      }
+      if (!["|", "|&", "&"].includes(entry.separatorAfter ?? "")) {
+        workingDirectory = staticCdDirectory(unit, unitCwd, this.policy.home, environment) ?? workingDirectory;
       }
     }
     return results;
@@ -803,11 +862,10 @@ export class GuardAnalyzer {
     shellEnvironment: ShellEnvironment = {},
     generatedPaths: GeneratedPathEnvironment = new Map(),
   ): Analysis {
-    for (const [pattern, reason] of CATASTROPHIC) {
-      if (pattern.test(command)) return this.result("deny", [`Catastrophic operation: ${reason}`]);
-    }
-
     const substitutions = maskCommandSubstitutions(command);
+    if (containsUnquotedForkBomb(substitutions.command)) {
+      return this.result("deny", ["Catastrophic operation: fork bomb"]);
+    }
     let tokens: ParseToken[];
     try {
       const normalizedCommand = substitutions.command.replace(/\\\r?\n/g, " ").replace(/\n/g, " ; ");
@@ -825,9 +883,7 @@ export class GuardAnalyzer {
     const unmatchedGlobArguments = new Set<string>();
     const unresolvedPathArguments = new Set<string>();
     const creationPatterns: string[] = [];
-
-    for (const source of substitutions.sources) {
-      const nested = this.analyzeCommand(source, cwd, shellEnvironment, generatedPaths);
+    const mergeNested = (nested: Analysis): void => {
       baseDecision = strongest(baseDecision, nested.decision);
       reasons.push(...nested.reasons);
       accesses.push(...nested.accesses);
@@ -836,6 +892,10 @@ export class GuardAnalyzer {
       unknownCommands.push(...(nested.unknownCommands ?? []));
       pathExpansions.push(...(nested.pathExpansions ?? []));
       creationPatterns.push(...(nested.creationPatterns ?? []));
+    };
+
+    for (const source of substitutions.sources) {
+      mergeNested(this.analyzeCommand(source, cwd, shellEnvironment, generatedPaths));
     }
     for (const segment of splitSegments(tokens)) {
       const commandWords: string[] = [];
@@ -880,7 +940,7 @@ export class GuardAnalyzer {
         }
         if (typeof token === "string") commandWords.push(token);
       }
-      const strings = cleanArgs(commandWords);
+      const strings = commandWords;
       if (!strings.length) continue;
       let index = 0;
       while (index < strings.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(strings[index])) index++;
@@ -941,6 +1001,8 @@ export class GuardAnalyzer {
         reasons.push(`Dynamic path cannot be resolved statically: ${arg}`);
         pathExpansions.push({ expression: arg, matches: [], unresolved: true });
       }
+      const catastrophic = catastrophicInvocation(cmd, args, cwd, this.policy.home);
+      if (catastrophic) return this.result("deny", [`Catastrophic operation: ${catastrophic}`]);
       const pathLikeArgument = (value: string): boolean => !unresolvedPathArguments.has(value) &&
         (unmatchedGlobArguments.has(value) || looksLikePath(value) || pathExists(this.path(value, cwd)));
       const argumentAccess = (value: string, kind: AccessKind, source: string): PathAccess => {
@@ -949,18 +1011,40 @@ export class GuardAnalyzer {
         return { path, kind, source, literal: unmatched || isLiteralShellPath(value), existed: unmatched ? false : pathExists(path) };
       };
 
+      if (cmd === "npm") {
+        const npm = selectNpmScripts(args, cwd);
+        if (npm.handled) {
+          if (npm.packageJson) {
+            const packageJson = this.path(npm.packageJson, cwd);
+            accesses.push({ path: packageJson, kind: "read", source: "npm script", literal: true, existed: pathExists(packageJson) });
+          }
+          if (npm.unresolvedReason || !npm.packageRoot || !npm.key) {
+            baseDecision = strongest(baseDecision, "ask");
+            reasons.push(npm.unresolvedReason ?? "npm script selection could not be resolved safely");
+          } else if (this.npmScriptStack.has(npm.key)) {
+            baseDecision = strongest(baseDecision, "ask");
+            reasons.push(`Recursive npm script requires approval: ${npm.key.split("\0").at(-1)}`);
+          } else {
+            this.npmScriptStack.add(npm.key);
+            try {
+              for (const script of npm.scripts) {
+                const source = script.appendArguments && npm.arguments.length
+                  ? `${script.source} ${shellQuote(npm.arguments)}`
+                  : script.source;
+                for (const unit of this.analyzeCommandUnits(source, npm.packageRoot)) {
+                  mergeNested(unit.analysis);
+                }
+              }
+            } finally { this.npmScriptStack.delete(npm.key); }
+          }
+          continue;
+        }
+      }
+
       if (cmd === "trap") {
         const trapArgs = args[0] === "--" ? args.slice(1) : args;
         if (!trapArgs.length || ["-l", "-p"].includes(trapArgs[0] ?? "") || ["-", ""].includes(trapArgs[0] ?? "")) continue;
-        const nested = this.analyzeCommand(trapArgs[0]!, cwd, shellEnvironment, generatedPaths);
-        baseDecision = strongest(baseDecision, nested.decision);
-        reasons.push(...nested.reasons);
-        accesses.push(...nested.accesses);
-        creations.push(...nested.creationCandidates);
-        trashable.push(...nested.trashablePaths);
-        unknownCommands.push(...(nested.unknownCommands ?? []));
-        pathExpansions.push(...(nested.pathExpansions ?? []));
-        creationPatterns.push(...(nested.creationPatterns ?? []));
+        mergeNested(this.analyzeCommand(trapArgs[0]!, cwd, shellEnvironment, generatedPaths));
         continue;
       }
 
@@ -1135,6 +1219,16 @@ export class GuardAnalyzer {
         continue;
       }
 
+      if (cmd === "xargs") {
+        baseDecision = strongest(baseDecision, "ask");
+        reasons.push("xargs executes a command with dynamically supplied arguments");
+        const action = xargsNestedCommand(args);
+        if (action?.length) {
+          mergeNested(this.analyzeCommand(shellQuote(action), cwd, shellEnvironment, generatedPaths));
+        }
+        continue;
+      }
+
       if (cmd === "find" && args.some((arg) => ["-delete", "-exec", "-execdir", "-ok", "-okdir"].includes(arg))) {
         const root = args[0] && !args[0].startsWith("-") ? args[0] : ".";
         if (args.includes("-delete")) {
@@ -1143,6 +1237,15 @@ export class GuardAnalyzer {
           baseDecision = strongest(baseDecision, "ask");
           reasons.push("find -exec/-execdir/-ok/-okdir executes a nested command");
           accesses.push({ path: this.path(root, cwd), kind: "read", source: "find", literal: isLiteralShellPath(root) });
+          for (let optionIndex = 0; optionIndex < args.length; optionIndex++) {
+            if (!["-exec", "-execdir", "-ok", "-okdir"].includes(args[optionIndex] ?? "")) continue;
+            const terminator = args.findIndex((arg, index) => index > optionIndex && [";", "+"].includes(arg));
+            const action = args.slice(optionIndex + 1, terminator < 0 ? args.length : terminator)
+              .map((arg) => arg === "{}" ? "__bash_guard_find_path__" : arg);
+            if (!action.length) continue;
+            mergeNested(this.analyzeCommand(shellQuote(action), cwd, shellEnvironment, generatedPaths));
+            optionIndex = terminator < 0 ? args.length : terminator;
+          }
         }
         continue;
       }
@@ -1166,20 +1269,40 @@ export class GuardAnalyzer {
       }
 
       if (INTERPRETERS.has(cmd)) {
+        if (cmd === "node" && !hasOpaqueInlineCode(cmd, args)) {
+          const tests = selectNodeTestFiles(args, cwd);
+          if (tests.enabled) {
+            if (tests.truncated) {
+              baseDecision = strongest(baseDecision, "ask");
+              reasons.push("Node test discovery exceeds 512 files and cannot be analyzed completely");
+            }
+            if (tests.unresolved) {
+              baseDecision = strongest(baseDecision, "ask");
+              reasons.push("Node test files could not be discovered safely");
+            }
+            for (const destination of tests.reporterDestinations) {
+              const path = this.path(destination, cwd);
+              if (pathExists(path)) accesses.push({ path, kind: "edit", source: "node --test reporter", literal: true, existed: true });
+              else creations.push(path);
+            }
+            for (const selected of new Set([...tests.supportFiles, ...tests.files])) {
+              const path = this.path(selected, cwd);
+              accesses.push({ path, kind: "execute", source: "node --test", literal: true, existed: pathExists(path) });
+              const screening = this.screenScript(path, cwd, "node");
+              if (screening) {
+                baseDecision = strongest(baseDecision, screening.decision);
+                reasons.push(screening.reason);
+              }
+            }
+            continue;
+          }
+        }
         if (SHELL_INTERPRETERS.has(cmd)) {
           const cIndex = args.findIndex((arg) => arg === "-c" || /^-[^-]*c/.test(arg));
           if (cIndex >= 0) {
             const source = args[cIndex + 1];
             if (source) {
-              const nested = this.analyzeCommand(source, cwd, shellEnvironment, generatedPaths);
-              baseDecision = strongest(baseDecision, nested.decision);
-              reasons.push(...nested.reasons);
-              accesses.push(...nested.accesses);
-              creations.push(...nested.creationCandidates);
-              trashable.push(...nested.trashablePaths);
-              unknownCommands.push(...(nested.unknownCommands ?? []));
-              pathExpansions.push(...(nested.pathExpansions ?? []));
-              creationPatterns.push(...(nested.creationPatterns ?? []));
+              mergeNested(this.analyzeCommand(source, cwd, shellEnvironment, generatedPaths));
             } else {
               baseDecision = strongest(baseDecision, "ask");
               reasons.push(`Shell interpreter ${cmd} has an unresolved inline command`);
@@ -1195,8 +1318,11 @@ export class GuardAnalyzer {
         if (script) {
           const path = this.path(script, cwd);
           accesses.push({ path, kind: "execute", source: cmd, literal: isLiteralShellPath(script), existed: pathExists(path) });
-          const screening = this.screenScript(path, cwd);
-          if (screening) return this.result("deny", [`Prohibited script content: ${screening}`], accesses);
+          const screening = this.screenScript(path, cwd, cmd);
+          if (screening) {
+            baseDecision = strongest(baseDecision, screening.decision);
+            reasons.push(screening.reason);
+          }
         } else { baseDecision = strongest(baseDecision, "ask"); reasons.push(`Opaque ${cmd} execution requires approval`); }
         continue;
       }
@@ -1204,7 +1330,10 @@ export class GuardAnalyzer {
       if (executableRaw.includes("/")) {
         const executable = this.path(executableRaw, cwd);
         const screening = this.screenScript(executable, cwd);
-        if (screening) return this.result("deny", [`Prohibited script content: ${screening}`]);
+        if (screening) {
+          baseDecision = strongest(baseDecision, screening.decision);
+          reasons.push(screening.reason);
+        }
         if (this.policy.isSystemReadonlyPath(executable)) {
           const systemCategory = builtinCommandCategory(cmd);
           if (!systemCategory) {
@@ -1325,11 +1454,49 @@ export class GuardAnalyzer {
     return result;
   }
 
-  private screenScript(path: string, cwd: string): string | undefined {
+  private screenScript(path: string, cwd: string, interpreter?: string): ScriptScreeningResult | undefined {
     if (!pathExists(path)) return undefined;
+    const key = canonicalPath(path);
+    if (this.screeningPaths.has(key)) return undefined;
+    this.screeningPaths.add(key);
     try {
+      if (statSync(path).size > 262_144) {
+        return { decision: "ask", reason: `Executable source exceeds the 256 KiB inspection limit: ${path}` };
+      }
       const text = readFileSync(path, { encoding: "utf8", flag: "r" }).slice(0, 262_144);
-      for (const [pattern, reason] of CATASTROPHIC) if (pattern.test(text)) return reason;
+      const language = scriptLanguage(path, interpreter, text);
+      if (language === "javascript") {
+        const screening = javascriptExecutions(text);
+        if (screening.parseError) {
+          return { decision: "ask", reason: `JavaScript/TypeScript source could not be inspected safely: ${path}` };
+        }
+        for (const execution of screening.executions) {
+          if (execution.kind === "module") {
+            const modulePath = this.path(execution.path, cwd);
+            if (!looksLikePath(execution.path) && !pathExists(modulePath)) continue;
+            const nested = this.screenScript(modulePath, cwd, "node");
+            if (nested) return nested;
+            continue;
+          }
+          const command = execution.kind === "shell"
+            ? execution.command
+            : shellQuote([execution.executable, ...execution.args]);
+          const nested = this.analyzeCommand(command, cwd);
+          if (nested.decision === "deny") {
+            return { decision: "deny", reason: `Prohibited executable script content: ${nested.reasons.join("; ")}` };
+          }
+        }
+      } else if (language === "shell") {
+        for (const unit of this.analyzeCommandUnits(text, cwd)) {
+          if (unit.analysis.decision === "deny") {
+            return { decision: "deny", reason: `Prohibited executable script content: ${unit.analysis.reasons.join("; ")}` };
+          }
+        }
+      } else {
+        const catastrophic = catastrophicTextReason(text);
+        if (catastrophic) return { decision: "deny", reason: `Prohibited script content: ${catastrophic}` };
+      }
+
       const references = new Set<string>();
       for (const match of text.matchAll(/(?:~\/|\/|\.\.?\/)[^\s"'`;,|&()]+/g)) references.add(match[0]);
       for (const line of text.split("\n")) {
@@ -1343,10 +1510,11 @@ export class GuardAnalyzer {
       for (const reference of references) {
         const candidate = this.path(reference, cwd);
         if ((looksLikePath(reference) || pathExists(candidate)) && this.policy.isSecret(candidate)) {
-          return `secret reference ${candidate}`;
+          return { decision: "deny", reason: `Prohibited script content: secret reference ${candidate}` };
         }
       }
     } catch { /* Binary or unreadable executable: ownership still controls execution. */ }
+    finally { this.screeningPaths.delete(key); }
     return undefined;
   }
 
