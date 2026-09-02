@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { GuardAnalyzer, splitShellCommandUnits } from "../analyzer.ts";
@@ -470,6 +470,9 @@ test("script and inline source mutations require target ownership", () => {
     const pythonHelper = join(f.workspace, "local_helper.py");
     const nodeImportScript = join(f.workspace, "imports.mjs");
     const nodeHelper = join(f.workspace, "local-helper.mjs");
+    const dynamicShellScript = join(f.workspace, "dynamic.sh");
+    const dynamicNodeScript = join(f.workspace, "dynamic.mjs");
+    const dynamicPythonScript = join(f.workspace, "dynamic.py");
     writeFileSync(target, "old\n");
     writeFileSync(owned, "old\n");
     writeFileSync(shellScript, `printf changed > ${target}\n`);
@@ -481,10 +484,20 @@ test("script and inline source mutations require target ownership", () => {
     writeFileSync(pythonImportScript, "import local_helper\nprint(local_helper.value)\n");
     writeFileSync(nodeHelper, "export const value = 1;\n");
     writeFileSync(nodeImportScript, 'import { value } from "./local-helper.mjs";\nconsole.log(value);\n');
+    writeFileSync(dynamicShellScript, 'rm "$RUNTIME"\n');
+    writeFileSync(dynamicNodeScript, 'import { writeFileSync } from "node:fs";\nwriteFileSync(runtimePath, "changed");\n');
+    writeFileSync(dynamicPythonScript, 'open(runtime_path, "w")\n');
     f.policy.addCreated(owned);
     f.policy.save("local", {
       version: 3,
-      ownership: { edit: [], execute: [], full: ["mutate.sh", "mutate.mjs", "mutate.py", "execute.mjs", "imports.py", "imports.mjs"] },
+      ownership: {
+        edit: [],
+        execute: [],
+        full: [
+          "mutate.sh", "mutate.mjs", "mutate.py", "execute.mjs", "imports.py", "imports.mjs",
+          "dynamic.sh", "dynamic.mjs", "dynamic.py",
+        ],
+      },
       secrets: [],
       commands: { include: [], exclude: [] },
     });
@@ -494,6 +507,9 @@ test("script and inline source mutations require target ownership", () => {
       assert.equal(result.decision, "ask", command);
       assert.deepEqual(result.ownershipCandidates, [{ path: target, required: "edit" }]);
     }
+    const sourced = f.analyzer.analyzeCommand(`source ${shellScript}`, f.workspace);
+    assert.equal(sourced.decision, "ask");
+    assert.deepEqual(sourced.ownershipCandidates, [{ path: target, required: "edit" }]);
     const execution = f.analyzer.analyzeCommand(`node ${executeScript}`, f.workspace);
     assert.equal(execution.decision, "ask");
     assert.deepEqual(execution.ownershipCandidates, [{ path: helper, required: "execute" }]);
@@ -503,6 +519,13 @@ test("script and inline source mutations require target ownership", () => {
     const nodeImported = f.analyzer.analyzeCommand(`node ${nodeImportScript}`, f.workspace);
     assert.equal(nodeImported.decision, "ask");
     assert.deepEqual(nodeImported.ownershipCandidates, [{ path: nodeHelper, required: "execute" }]);
+    for (const command of [
+      `bash ${dynamicShellScript}`,
+      `node ${dynamicNodeScript}`,
+      `python ${dynamicPythonScript}`,
+    ]) {
+      assert.equal(f.analyzer.analyzeCommand(command, f.workspace).decision, "allow", command);
+    }
     assert.equal(
       f.analyzer.analyzeCommand(`node -e 'require("node:fs").writeFileSync("${owned}", "changed")'`, f.workspace).decision,
       "allow",
@@ -515,35 +538,230 @@ test("script and inline source mutations require target ownership", () => {
       f.analyzer.analyzeCommand(`python -c 'open("${owned}", "w").write("changed")'`, f.workspace).decision,
       "allow",
     );
-    assert.match(
-      f.analyzer.analyzeCommand(`node -e 'require("node:fs").writeFileSync(runtimePath, "changed")'`, f.workspace).reasons.join(" "),
-      /Dynamic mutative path/,
+    const gitMetadata = join(f.workspace, ".git", "config");
+    mkdirSync(join(f.workspace, ".git"));
+    writeFileSync(gitMetadata, "old\n");
+    assert.equal(
+      f.analyzer.analyzeCommand(`node -e 'require("node:fs").writeFileSync("${gitMetadata}", "changed")'`, f.workspace).decision,
+      "deny",
     );
+    for (const command of [
+      `node -e 'require("node:fs").writeFileSync(runtimePath, "changed")'`,
+      `node -e 'require("node:child_process").execSync(runtimeCommand)'`,
+      `node -e 'require("node:child_process").spawnSync("printf", [runtimeValue])'`,
+      `node -e 'require("node:child_process").spawnSync("rm", [runtimeValue])'`,
+      `python -c 'import subprocess; subprocess.run(["printf", runtime_value])'`,
+      `node -e 'import(runtimeModule)'`,
+      `python -c 'import importlib; importlib.import_module(runtime_module)'`,
+      `python -c 'import subprocess; subprocess.run(["rm", runtime_value], cwd=runtime_cwd)'`,
+      `python -c 'open(runtime_path, "w")'`,
+      `bash -c 'rm "$RUNTIME"'`,
+      `bash -c 'printf value > "$RUNTIME"'`,
+      `bash -c 'chmod 600 "$RUNTIME"'`,
+      `bash -c 'npm run "$SCRIPT"'`,
+      `bash -c 'npm --workspace "$WORKSPACE" test'`,
+      `bash -c 'npm --script-shell "$SHELL" test'`,
+      `bash -c 'cp "$SOURCE" "$DESTINATION"'`,
+      `bash -c 'mv "$SOURCE" "$DESTINATION"'`,
+      `bash -c '"$COMMAND" --flag'`,
+      `bash -c 'source "$MODULE"'`,
+      `bash -c 'git -C "$ROOT" init'`,
+      `bash -c 'curl -X POST "$URL"'`,
+      `bash -c 'sudo rm "$TARGET"'`,
+    ]) {
+      const result = f.analyzer.analyzeCommand(command, f.workspace);
+      assert.equal(result.decision, "allow", command);
+      assert.equal(result.reasons.some((reason) => /[Dd]ynamic|unresolved/.test(reason)), false, command);
+    }
+    assert.match(f.analyzer.analyzeCommand(`rm "$RUNTIME"`, f.workspace).reasons.join(" "), /Dynamic deletion target/);
+    assert.match(f.analyzer.analyzeCommand(`printf value > "$RUNTIME"`, f.workspace).reasons.join(" "), /Dynamic redirection target/);
+    assert.match(f.analyzer.analyzeCommand(`chmod 600 "$RUNTIME"`, f.workspace).reasons.join(" "), /dynamic mutation arguments/);
+    assert.match(f.analyzer.analyzeCommand(`npm run "$SCRIPT"`, f.workspace).reasons.join(" "), /script name cannot be resolved/);
+    assert.match(f.analyzer.analyzeCommand(`npm --workspace "$WORKSPACE" test`, f.workspace).reasons.join(" "), /workspace/);
+    assert.match(f.analyzer.analyzeCommand(`npm --script-shell "$SHELL" test`, f.workspace).reasons.join(" "), /script shell/);
+    assert.match(f.analyzer.analyzeCommand(`cp "$SOURCE" "$DESTINATION"`, f.workspace).reasons.join(" "), /Dynamic cp path/);
+    assert.match(f.analyzer.analyzeCommand(`mv "$SOURCE" "$DESTINATION"`, f.workspace).reasons.join(" "), /Dynamic mv path/);
+    assert.match(f.analyzer.analyzeCommand(`"$COMMAND" --flag`, f.workspace).reasons.join(" "), /Executable variable/);
+    assert.match(f.analyzer.analyzeCommand(`source "$MODULE"`, f.workspace).reasons.join(" "), /Dynamic execution target/);
+    assert.match(f.analyzer.analyzeCommand(`git -C "$ROOT" init`, f.workspace).reasons.join(" "), /Mutative or unknown Git/);
+    assert.match(f.analyzer.analyzeCommand(`curl -X POST "$URL"`, f.workspace).reasons.join(" "), /may mutate remote/);
+    assert.match(f.analyzer.analyzeCommand(`sudo rm "$TARGET"`, f.workspace).reasons.join(" "), /Elevated execution/);
     assert.match(
-      f.analyzer.analyzeCommand(`node -e 'require("node:child_process").execSync(runtimeCommand)'`, f.workspace).reasons.join(" "),
-      /Dynamic shell execution/,
+      f.analyzer.analyzeCommand(`bash -c 'mystery-command --flag'`, f.workspace).reasons.join(" "),
+      /Unknown command mystery-command/,
     );
     assert.equal(
-      f.analyzer.analyzeCommand(`node -e 'require("node:child_process").spawnSync("printf", [runtimeValue])'`, f.workspace).decision,
-      "allow",
-    );
-    assert.equal(
-      f.analyzer.analyzeCommand(`python -c 'import subprocess; subprocess.run(["printf", runtime_value])'`, f.workspace).decision,
-      "allow",
+      f.analyzer.analyzeCommand(`bash -c 'curl -X POST https://example.invalid/resource'`, f.workspace).decision,
+      "ask",
     );
     assert.match(
-      f.analyzer.analyzeCommand(`node -e 'require("node:child_process").spawnSync("rm", [runtimeValue])'`, f.workspace).reasons.join(" "),
-      /Dynamic process arguments/,
+      f.analyzer.analyzeCommand(`node -e 'require("node:child_process").spawnSync("mystery-command")'`, f.workspace).reasons.join(" "),
+      /Unknown command mystery-command/,
     );
-    assert.match(
-      f.analyzer.analyzeCommand(`python -c 'open(runtime_path, "w")'`, f.workspace).reasons.join(" "),
-      /Dynamic mutative path/,
+    const partiallyConcreteCopy = f.analyzer.analyzeCommand(
+      `bash -c 'cp "$SOURCE" "${target}"'`,
+      f.workspace,
     );
-    assert.match(f.analyzer.analyzeCommand(`bash -c 'rm "$RUNTIME"'`, f.workspace).reasons.join(" "), /Dynamic deletion target/);
-    assert.match(f.analyzer.analyzeCommand(`bash -c 'printf value > "$RUNTIME"'`, f.workspace).reasons.join(" "), /Dynamic redirection target/);
-    assert.match(f.analyzer.analyzeCommand(`bash -c 'chmod 600 "$RUNTIME"'`, f.workspace).reasons.join(" "), /dynamic mutation arguments/);
+    assert.equal(partiallyConcreteCopy.decision, "ask");
+    assert.deepEqual(partiallyConcreteCopy.ownershipCandidates, [{ path: target, required: "edit" }]);
+    const partiallyConcreteDelete = f.analyzer.analyzeCommand(
+      `node -e 'require("node:child_process").spawnSync("rm", ["${target}", runtimeValue])'`,
+      f.workspace,
+    );
+    assert.equal(partiallyConcreteDelete.decision, "deny");
+    assert.match(partiallyConcreteDelete.reasons.join(" "), /deletion without edit ownership is prohibited/i);
+    const partiallyConcreteCatastrophe = f.analyzer.analyzeCommand(
+      `node -e 'require("node:child_process").spawnSync("shutdown", [runtimeValue])'`,
+      f.workspace,
+    );
+    assert.equal(partiallyConcreteCatastrophe.decision, "deny");
+    assert.match(partiallyConcreteCatastrophe.reasons.join(" "), /system power operation/);
+    const dynamicFindCatastrophe = f.analyzer.analyzeCommand(
+      `bash -c 'find "$ROOT" -exec shutdown now \\;'`,
+      f.workspace,
+    );
+    assert.equal(dynamicFindCatastrophe.decision, "deny");
+    assert.match(dynamicFindCatastrophe.reasons.join(" "), /system power operation/);
+    const dynamicCwdCatastrophe = f.analyzer.analyzeCommand(
+      `python -c 'import subprocess; subprocess.run(["shutdown", runtime_value], cwd=runtime_cwd)'`,
+      f.workspace,
+    );
+    assert.equal(dynamicCwdCatastrophe.decision, "deny");
+    assert.match(dynamicCwdCatastrophe.reasons.join(" "), /system power operation/);
+    const partiallyConcreteExecution = f.analyzer.analyzeCommand(
+      `node -e 'require("node:child_process").spawnSync("${helper}", [runtimeValue])'`,
+      f.workspace,
+    );
+    assert.equal(partiallyConcreteExecution.decision, "ask");
+    assert.deepEqual(partiallyConcreteExecution.ownershipCandidates, [{ path: helper, required: "execute" }]);
   } finally { f.cleanup(); }
 });
+test("source screening uses static evidence and stops at external dependency boundaries", () => {
+  const f = fixture();
+  try {
+    const testsDirectory = join(f.workspace, "tests");
+    const testFile = join(testsDirectory, "dynamic-fixture.test.ts");
+    const packageJson = join(f.workspace, "package.json");
+    mkdirSync(testsDirectory);
+    writeFileSync(packageJson, JSON.stringify({ scripts: {
+      pretest: 'rm "$DYNAMIC_PRETEST_TARGET"',
+      test: "node --test tests/*.test.ts",
+    } }));
+    writeFileSync(testFile, [
+      'import test from "node:test";',
+      'import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";',
+      'import { spawnSync } from "node:child_process";',
+      'import { tmpdir } from "node:os";',
+      'import { join } from "node:path";',
+      'function fixture() {',
+      '  const root = mkdtempSync(join(tmpdir(), "bash-guard-static-evidence-"));',
+      '  return { root, path: join(root, "value.txt") };',
+      '}',
+      'function run(command, args) { return spawnSync(command, args); }',
+      'test("isolated fixture", () => {',
+      '  const value = fixture();',
+      '  mkdirSync(join(value.root, "nested"));',
+      '  writeFileSync(value.path, "value");',
+      '  readFileSync(value.path, "utf8");',
+      '  run("git", ["-C", value.root, "init", "--quiet"]);',
+      '  rmSync(value.root, { recursive: true, force: true });',
+      '});',
+    ].join("\n"));
+    f.policy.save("local", {
+      version: 3,
+      ownership: { edit: [], execute: [], full: ["tests/**"] },
+      secrets: [],
+      commands: { include: [], exclude: [] },
+    });
+    const npmTest = f.analyzer.analyzeCommand("npm test", f.workspace);
+    assert.equal(npmTest.decision, "allow");
+    assert.equal(npmTest.reasons.some((reason) => /dynamic|unresolved/i.test(reason)), false);
+
+    const application = join(f.workspace, "packages", "app");
+    const localEntry = join(application, "entry.mjs");
+    const localHelper = join(f.workspace, "shared-helper.mjs");
+    const concreteTarget = join(f.workspace, "concrete-unowned.txt");
+    mkdirSync(application, { recursive: true });
+    writeFileSync(concreteTarget, "old\n");
+    writeFileSync(localHelper, `import { writeFileSync } from "node:fs";\nwriteFileSync("${concreteTarget}", "changed");\n`);
+    writeFileSync(localEntry, 'import "../../shared-helper.mjs";\n');
+    f.policy.save("local", {
+      version: 3,
+      ownership: { edit: [], execute: [], full: ["packages/**", "shared-helper.mjs"] },
+      secrets: [],
+      commands: { include: [], exclude: [] },
+    });
+    const localImport = f.analyzer.analyzeCommandUnits(`cd ${application} && node entry.mjs`, f.workspace).at(-1)!.analysis;
+    assert.equal(localImport.decision, "ask");
+    assert.deepEqual(localImport.ownershipCandidates, [{ path: concreteTarget, required: "edit" }]);
+
+    const oversizedLocal = join(f.workspace, "oversized-local.mjs");
+    const oversizedEntry = join(f.workspace, "oversized-entry.mjs");
+    writeFileSync(oversizedLocal, `// bounded local source\n${" ".repeat(262_145)}`);
+    writeFileSync(oversizedEntry, 'import "./oversized-local.mjs";\n');
+    f.policy.save("local", {
+      version: 3,
+      ownership: { edit: [], execute: [], full: ["oversized-entry.mjs", "oversized-local.mjs"] },
+      secrets: [],
+      commands: { include: [], exclude: [] },
+    });
+    const oversizedRun = f.analyzer.analyzeCommand(`node ${oversizedEntry}`, f.workspace);
+    assert.equal(oversizedRun.decision, "ask");
+    assert.match(oversizedRun.reasons.join(" "), /256 KiB/);
+
+    const compiler = join(f.systemReadonly, "typescript", "bin", "tsc.js");
+    mkdirSync(join(f.systemReadonly, "typescript", "bin"), { recursive: true });
+    writeFileSync(compiler, `// immutable compiler implementation\n${" ".repeat(262_145)}`);
+    const compilerCheck = f.analyzer.analyzeCommand(`node ${compiler} --project ${f.workspace}`, f.workspace);
+    assert.equal(compilerCheck.decision, "allow");
+    assert.doesNotMatch(compilerCheck.reasons.join(" "), /256 KiB/);
+
+    const dependencyDirectory = join(f.workspace, "node_modules", "fixture-package");
+    const dependency = join(dependencyDirectory, "index.js");
+    const entry = join(f.workspace, "dependency-entry.mjs");
+    mkdirSync(dependencyDirectory, { recursive: true });
+    writeFileSync(dependency, `// installed dependency\n${" ".repeat(262_145)}`);
+    writeFileSync(entry, 'import "./node_modules/fixture-package/index.js";\n');
+    f.policy.save("local", {
+      version: 3,
+      ownership: { edit: [], execute: [], full: ["dependency-entry.mjs", "node_modules/**"] },
+      secrets: [],
+      commands: { include: [], exclude: [] },
+    });
+    const dependencyRun = f.analyzer.analyzeCommand(`node ${entry}`, f.workspace);
+    assert.equal(dependencyRun.decision, "allow");
+    assert.doesNotMatch(dependencyRun.reasons.join(" "), /256 KiB/);
+
+    const outside = join(f.root, "outside-module.mjs");
+    const escaped = join(f.workspace, "escaped-module.mjs");
+    const escapedEntry = join(f.workspace, "escaped-entry.mjs");
+    writeFileSync(outside, `// source outside project\n${" ".repeat(262_145)}`);
+    symlinkSync(outside, escaped);
+    writeFileSync(escapedEntry, 'import "./escaped-module.mjs";\n');
+    f.policy.save("local", {
+      version: 3,
+      ownership: { edit: [], execute: [], full: ["escaped-entry.mjs", outside] },
+      secrets: [],
+      commands: { include: [], exclude: [] },
+    });
+    const escapedRun = f.analyzer.analyzeCommand(`node ${escapedEntry}`, f.workspace);
+    assert.equal(escapedRun.decision, "allow");
+    assert.doesNotMatch(escapedRun.reasons.join(" "), /256 KiB/);
+
+    const externalEntry = join(f.root, "external-entry.mjs");
+    writeFileSync(externalEntry, `import { writeFileSync } from "node:fs";\nwriteFileSync("${concreteTarget}", "changed");\n`);
+    f.policy.save("local", {
+      version: 3,
+      ownership: { edit: [], execute: [], full: [externalEntry] },
+      secrets: [],
+      commands: { include: [], exclude: [] },
+    });
+    const externalRun = f.analyzer.analyzeCommand(`node ${externalEntry}`, f.workspace);
+    assert.equal(externalRun.decision, "ask");
+    assert.deepEqual(externalRun.ownershipCandidates, [{ path: concreteTarget, required: "edit" }]);
+  } finally { f.cleanup(); }
+});
+
 
 test("inline heredocs are language-screened and retain shell command order", () => {
   const f = fixture();

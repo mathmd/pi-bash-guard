@@ -20,6 +20,7 @@ export interface NpmScriptSelection {
   scripts: NpmLifecycleScript[];
   arguments: string[];
   unresolvedReason?: string;
+  dynamicSelection?: boolean;
   key?: string;
 }
 
@@ -49,6 +50,8 @@ function optionValue(arg: string): { option: string; inline?: string } {
 export function selectNpmScripts(args: string[], cwd: string): NpmScriptSelection {
   let prefix = cwd;
   let workspaceSelection = false;
+  let dynamicWorkspace = false;
+  let dynamicScriptShell = false;
   let explicitScriptShell = false;
   let dynamicPrefix = false;
   let command: string | undefined;
@@ -64,8 +67,14 @@ export function selectNpmScripts(args: string[], cwd: string): NpmScriptSelectio
       if (isDynamicShellValue(value)) dynamicPrefix = true;
       else prefix = resolve(cwd, value);
     }
-    if (option === "--script-shell") explicitScriptShell = true;
-    if (option === "--workspace" || option === "-w") workspaceSelection = true;
+    if (option === "--script-shell") {
+      explicitScriptShell = true;
+      if (value && isDynamicShellValue(value)) dynamicScriptShell = true;
+    }
+    if (option === "--workspace" || option === "-w") {
+      workspaceSelection = true;
+      if (value && isDynamicShellValue(value)) dynamicWorkspace = true;
+    }
   }
 
   if (!command) return { handled: false, scripts: [], arguments: [] };
@@ -84,14 +93,35 @@ export function selectNpmScripts(args: string[], cwd: string): NpmScriptSelectio
 
   const separator = remainder.indexOf("--");
   const forwarded = separator >= 0 ? remainder.slice(separator + 1) : [];
+  if (isDynamicShellValue(scriptName)) {
+    return {
+      handled: true,
+      scripts: [],
+      arguments: forwarded,
+      unresolvedReason: "npm script name cannot be resolved statically",
+      dynamicSelection: true,
+    };
+  }
   if (dynamicPrefix || explicitScriptShell) {
     const reason = dynamicPrefix
       ? "npm package prefix cannot be resolved statically"
       : "An explicit npm script shell cannot be analyzed as Bash safely";
-    return { handled: true, scripts: [], arguments: forwarded, unresolvedReason: reason };
+    return {
+      handled: true,
+      scripts: [],
+      arguments: forwarded,
+      unresolvedReason: reason,
+      ...((dynamicPrefix || dynamicScriptShell) ? { dynamicSelection: true } : {}),
+    };
   }
   if (workspaceSelection) {
-    return { handled: true, scripts: [], arguments: forwarded, unresolvedReason: "npm workspace script selection cannot be resolved statically" };
+    return {
+      handled: true,
+      scripts: [],
+      arguments: forwarded,
+      unresolvedReason: "npm workspace script selection cannot be resolved statically",
+      ...(dynamicWorkspace ? { dynamicSelection: true } : {}),
+    };
   }
 
   const packageJson = packageJsonFrom(prefix);

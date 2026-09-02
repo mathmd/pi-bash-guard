@@ -338,7 +338,12 @@ export function javascriptExecutions(source: string): JavaScriptScreening {
       const label = `node:child_process.${sink.name}`;
       if (sink.kind === "shell") executions.push({ kind: "shell", command: first, source: label });
       else if (sink.kind === "module") executions.push({ kind: "module", path: first, source: label, language: "javascript" });
-      else executions.push({ kind: "argv", executable: first, args: arrayValue(args[1], strings, arrays), source: label });
+      else executions.push({
+        kind: "argv",
+        executable: first,
+        args: args[1] === undefined ? [] : arrayValue(args[1], strings, arrays),
+        source: label,
+      });
       return;
     }
 

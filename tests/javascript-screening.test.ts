@@ -33,6 +33,13 @@ test("child-process shell and argv sinks expose concrete commands", () => {
   });
 });
 
+test("omitted child-process argv is concrete rather than dynamically unresolved", () => {
+  const result = javascriptExecutions('import { spawnSync } from "node:child_process"; spawnSync("printf");');
+  assert.deepEqual(result.executions, [
+    { kind: "argv", executable: "printf", args: [], source: "node:child_process.spawnSync" },
+  ]);
+});
+
 test("CommonJS child-process namespaces and local module targets are recognized", () => {
   const result = javascriptExecutions(`
     const childProcess = require("child_process");

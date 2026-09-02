@@ -43,6 +43,11 @@ test("npm run aliases and ignore-scripts select only static manifest entries", (
     writeFileSync(join(f.root, "package.json"), JSON.stringify({ scripts: { prelint: "shutdown now" } }));
     assert.deepEqual(selectNpmScripts(["run", "lint"], f.root).scripts, []);
     assert.equal(selectNpmScripts(["install"], f.root).handled, false);
+    const dynamic = selectNpmScripts(["run", "$SCRIPT"], f.root);
+    assert.equal(dynamic.dynamicSelection, true);
+    assert.match(dynamic.unresolvedReason ?? "", /script name/);
+    assert.equal(selectNpmScripts(["--workspace", "$WORKSPACE", "test"], f.root).dynamicSelection, true);
+    assert.equal(selectNpmScripts(["--script-shell", "$SHELL", "test"], f.root).dynamicSelection, true);
   } finally { f.cleanup(); }
 });
 
