@@ -3,8 +3,42 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { editorInvocation } from "../external-editor.ts";
-import { detailViewport, formatTimeout, ownershipGrantLevels, shellBindingDetails } from "../ui.ts";
+import type { PolicyStore } from "../policy.ts";
+import { detailViewport, formatTimeout, ownershipGrantLevels, promptForDecision, shellBindingDetails, STEERING_CHOICE } from "../ui.ts";
+
+interface PromptHarness {
+  ctx: ExtensionContext;
+  menus: string[][];
+  editorTitles: string[];
+  notifications: string[];
+}
+
+function promptHarness(selections: string[], editorValues: Array<string | undefined>): PromptHarness {
+  const menus: string[][] = [];
+  const editorTitles: string[] = [];
+  const notifications: string[] = [];
+  const ctx = {
+    mode: "rpc",
+    hasUI: true,
+    ui: {
+      select: async (_title: string, options: string[]) => {
+        menus.push([...options]);
+        const selection = selections.shift();
+        assert.ok(selection, "test must provide a scripted menu selection");
+        assert.ok(options.includes(selection), `${selection} must be present in the menu`);
+        return selection;
+      },
+      editor: async (title: string) => {
+        editorTitles.push(title);
+        return editorValues.shift();
+      },
+      notify: (message: string) => notifications.push(message),
+    },
+  } as unknown as ExtensionContext;
+  return { ctx, menus, editorTitles, notifications };
+}
 
 test("Neovim opens the policy at the newly appended entry", () => {
   const root = mkdtempSync(join(tmpdir(), "bash-guard-editor-"));
@@ -93,4 +127,61 @@ test("permission details list concrete shell glob matches", () => {
   assert.match(details, /Expanded shell path "scripts\/\*\.lua"/);
   assert.match(details, /\/tmp\/project\/scripts\/a\.lua/);
   assert.match(details, /\/tmp\/project\/scripts\/b\.lua/);
+});
+
+test("steering returns to the pending permission and comments use the multiline editor", async () => {
+  const policy = {
+    permissionTimeoutMs: () => 0,
+    isPolicyPath: () => false,
+  } as unknown as PolicyStore;
+  const analysis = {
+    decision: "ask" as const,
+    reasons: ["Approval required"],
+    accesses: [],
+    creationCandidates: [],
+    trashablePaths: [],
+    ownershipCandidates: [],
+  };
+  const steering: string[] = [];
+  const steerPrompt = promptHarness(
+    [STEERING_CHOICE, STEERING_CHOICE, "Allow once"],
+    ["  Why is this needed?  ", "Use the read-only alternative if possible."],
+  );
+  const allowed = await promptForDecision(
+    steerPrompt.ctx,
+    policy,
+    analysis,
+    "Pending command",
+    undefined,
+    undefined,
+    (text) => { steering.push(text); },
+  );
+  assert.deepEqual(allowed, { action: "allow" });
+  assert.deepEqual(steering, ["Why is this needed?", "Use the read-only alternative if possible."]);
+  assert.equal(steerPrompt.menus.length, 3, "permission must be shown again after every steering message");
+  assert.ok(steerPrompt.menus.every((choices) => choices.includes("Allow once") && choices.includes("Refuse")));
+  assert.ok(steerPrompt.editorTitles.every((title) => /permission remains pending/.test(title)));
+  assert.equal(steerPrompt.notifications.length, 2);
+  assert.ok(steerPrompt.notifications.every((message) => /permission decision is still pending/.test(message)));
+
+  const refusal = promptHarness(["Refuse", "Add comment…"], ["  Stop here.\nUse the safer command.  "]);
+  const refused = await promptForDecision(refusal.ctx, policy, analysis, "Pending command");
+  assert.deepEqual(refused, { action: "refuse", context: "Stop here.\nUse the safer command." });
+  assert.deepEqual(refusal.editorTitles, ["Comment on refusal"]);
+
+  const deniedSteering: string[] = [];
+  const denyPrompt = promptHarness([STEERING_CHOICE, "Refuse", "Refuse without comment"], ["Explain the hard denial."]);
+  const denied = await promptForDecision(
+    denyPrompt.ctx,
+    policy,
+    { ...analysis, decision: "deny" },
+    "Prohibited command",
+    undefined,
+    undefined,
+    (text) => { deniedSteering.push(text); },
+  );
+  assert.deepEqual(denied, { action: "refuse" });
+  assert.deepEqual(deniedSteering, ["Explain the hard denial."]);
+  assert.ok(denyPrompt.menus[0]!.includes(STEERING_CHOICE));
+  assert.ok(denyPrompt.menus[1]!.includes(STEERING_CHOICE));
 });

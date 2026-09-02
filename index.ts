@@ -153,7 +153,15 @@ export default function bashGuard(pi: ExtensionAPI): void {
           ? event.toolName
           : undefined;
         const trustedCommand = isToolCallEventType("bash", event) ? suggestedTrustedCommand(itemAnalysis) : undefined;
-        const response = await promptForDecision(ctx, policy!, promptAnalysis, item.subject, readOnlyTool, trustedCommand);
+        const response = await promptForDecision(
+          ctx,
+          policy!,
+          promptAnalysis,
+          item.subject,
+          readOnlyTool,
+          trustedCommand,
+          (text) => pi.sendUserMessage(text, { deliverAs: "steer" }),
+        );
         if (response.action === "allow") break;
         if (response.action === "reevaluate") continue;
         if (response.action === "trash" && isToolCallEventType("bash", event) && itemAnalysis.trashablePaths.length && promptItems.length === 1) {
