@@ -5,7 +5,7 @@ import { quote as shellQuote } from "shell-quote";
 import type { ExtensionAPI, ToolCallEvent, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { GuardAnalyzer } from "./analyzer.ts";
-import { canonicalPath, containsGitMetadata, pathExists, resolvePath } from "./path-utils.ts";
+import { canonicalPath, containsGitMetadata, matchingGlobPaths, pathExists, resolvePath } from "./path-utils.ts";
 import { PolicyStore } from "./policy.ts";
 import type { Analysis } from "./types.ts";
 import { strongest } from "./types.ts";
@@ -14,7 +14,12 @@ import { sendSystemNotification } from "./notifications.ts";
 import { genericPathInputs } from "./tool-paths.ts";
 
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
-interface PendingCreation { paths: string[]; reloadPolicy: boolean; }
+interface PendingCreation {
+  paths: string[];
+  patterns: Array<{ pattern: string; before: Set<string> }>;
+  reloadPolicy: boolean;
+}
+
 
 function mergeAnalyses(items: Analysis[]): Analysis {
   return items.reduce<Analysis>((result, item) => ({
@@ -33,6 +38,7 @@ function mergeAnalyses(items: Analysis[]): Analysis {
       all.findIndex((other) => other.expression === expansion.expression &&
         other.matches.length === expansion.matches.length && other.matches.every((value, matchIndex) => value === expansion.matches[matchIndex]) &&
         other.unresolved === expansion.unresolved && other.truncated === expansion.truncated) === index),
+    creationPatterns: [...new Set([...(result.creationPatterns ?? []), ...(item.creationPatterns ?? [])])],
   }), { decision: "allow", reasons: [], accesses: [], creationCandidates: [], trashablePaths: [], ownershipCandidates: [] });
 }
 
@@ -64,7 +70,7 @@ function subjectFor(event: ToolCallEvent): string {
 
 function suggestedTrustedCommand(analysis: Analysis): { name: string; arguments: string[] } | undefined {
   return analysis.unknownCommands?.find((candidate) =>
-    [candidate.name, ...candidate.arguments].every((value) => !/\$(?:\(|\{|[A-Za-z_0-9])|`/.test(value)));
+    [candidate.name, ...candidate.arguments].every((value) => !/\$(?:[$?!#*@0-9-]|\(|\{|[A-Za-z_])|`/.test(value)));
 }
 
 export default function bashGuard(pi: ExtensionAPI): void {
@@ -98,9 +104,10 @@ export default function bashGuard(pi: ExtensionAPI): void {
   pi.on("tool_call", async (event, ctx) => {
     configure(ctx.cwd, ctx.isProjectTrusted());
     const analysis = analyzeTool(event, ctx.cwd, analyzer!, policy!);
-    if (analysis.creationCandidates.length) {
+    if (analysis.creationCandidates.length || analysis.creationPatterns?.length) {
       pending.set(event.toolCallId, {
         paths: analysis.creationCandidates.filter((path) => !existsSync(path)),
+        patterns: (analysis.creationPatterns ?? []).map((pattern) => ({ pattern, before: matchingGlobPaths(pattern) })),
         reloadPolicy: analysis.creationCandidates.some((path) => policy!.isPolicyPath(path)),
       });
     }
@@ -170,6 +177,9 @@ export default function bashGuard(pi: ExtensionAPI): void {
     pending.delete(event.toolCallId);
     if (!record || event.isError || !policy) return;
     for (const path of record.paths) if (pathExists(path)) policy.addCreated(path);
+    for (const { pattern, before } of record.patterns) {
+      for (const path of matchingGlobPaths(pattern)) if (!before.has(path)) policy.addCreated(path);
+    }
     if (record.reloadPolicy) policy.reload();
   });
 

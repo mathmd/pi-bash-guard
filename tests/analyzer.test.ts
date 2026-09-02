@@ -159,7 +159,7 @@ test("new creation is allowed and an existing unowned edit asks", () => {
   } finally { f.cleanup(); }
 });
 
-test("copy analysis expands prior assignments and checks concrete destination files", () => {
+test("shell assignments propagate literal and runtime-generated paths", () => {
   const f = fixture();
   try {
     const source = join(f.systemReadonly, "package-assets");
@@ -214,6 +214,42 @@ test("copy analysis expands prior assignments and checks concrete destination fi
     ].join("\n"), f.workspace).at(-1)!.analysis;
     assert.equal(recursiveOverwrite.decision, "ask");
     assert.deepEqual(recursiveOverwrite.ownershipCandidates, [{ path: existingFont, required: "edit" }]);
+
+    const runtimeUnits = f.analyzer.analyzeCommandUnits([
+      "tmp=$(mktemp -d)",
+      "trap 'rm -rf \"$tmp\"' EXIT",
+      "git clone https://example.invalid/repo.git \"$tmp/repo\"",
+      "git -C \"$tmp/repo\" sparse-checkout init --cone",
+      "rg needle \"$tmp/repo/src\"",
+    ].join("; "), f.workspace);
+    assert.deepEqual(runtimeUnits[0]?.analysis.creationPatterns, ["/tmp/tmp.*"]);
+    assert.equal(runtimeUnits.find((unit) => unit.command.startsWith("trap "))?.analysis.decision, "allow");
+    assert.equal(runtimeUnits.find((unit) => unit.command.startsWith("rg "))?.analysis.decision, "allow");
+    assert.equal(runtimeUnits.find((unit) => unit.command.startsWith("git clone"))?.analysis.decision, "allow");
+    const runtimePrompts = runtimeUnits.filter((unit) => unit.analysis.decision !== "allow");
+    assert.deepEqual(runtimePrompts.map((unit) => unit.analysis.reasons), [
+      ["Mutative or unknown Git operation (sparse-checkout) requires approval"],
+    ]);
+    assert.equal(runtimePrompts.some((unit) => unit.analysis.reasons.some((reason) => reason.includes("Dynamic path"))), false);
+    for (const unit of runtimePrompts) {
+      const tmpBinding = unit.resolvedBindings?.find(({ name }) => name === "tmp");
+      assert.equal(tmpBinding?.symbolic, "runtime directory created by mktemp under /tmp");
+      assert.match(tmpBinding?.value ?? "", /^\/tmp\/\.bash-guard-mktemp-tmp-/);
+    }
+
+    const pidUnits = f.analyzer.analyzeCommandUnits([
+      "repo=/tmp/hyprland-research-$$",
+      "git clone https://example.invalid/repo.git \"$repo\"",
+      "cd \"$repo\"",
+      "git show -s --format=%H",
+      "rg needle \"$repo/src\"",
+    ].join("; "), f.workspace);
+    assert.equal(pidUnits.every((unit) => unit.analysis.decision === "allow"), true);
+    const pidClone = pidUnits.find((unit) => unit.command.startsWith("git clone"));
+    assert.deepEqual(pidClone?.analysis.creationPatterns, ["/tmp/hyprland-research-[0-9]*"]);
+    const repoBinding = pidClone?.resolvedBindings?.find(({ name }) => name === "repo");
+    assert.equal(repoBinding?.symbolic, "runtime path /tmp/hyprland-research-<shell-pid>");
+    assert.equal(pidUnits.some((unit) => unit.analysis.reasons.some((reason) => reason.includes("Dynamic path"))), false);
   } finally { f.cleanup(); }
 });
 
@@ -225,6 +261,11 @@ test("edit ownership permits editing and deletion but still asks execution", () 
     f.policy.addCreated(file);
     assert.equal(f.analyzer.analyzeCommand(`touch ${file}`, f.workspace).decision, "allow");
     assert.equal(f.analyzer.analyzeCommand(`rm ${file}`, f.workspace).decision, "allow");
+    const directory = join(f.workspace, "owned-directory");
+    mkdirSync(directory);
+    writeFileSync(join(directory, "child"), "safe\n");
+    f.policy.addCreated(directory);
+    assert.equal(f.analyzer.analyzeCommand(`rm -rf ${directory}`, f.workspace).decision, "allow");
     assert.equal(f.analyzer.analyzeCommand(`bash ${file}`, f.workspace).decision, "ask");
   } finally { f.cleanup(); }
 });
@@ -316,6 +357,19 @@ test("Git read operations allow, mutations ask, and forced push denies", () => {
     ];
     for (const command of mutative) assert.equal(f.analyzer.analyzeCommand(command, f.workspace).decision, "ask", command);
 
+    const cloneTarget = join(f.workspace, "fresh-clone");
+    const clone = f.analyzer.analyzeCommand(`git clone https://example.invalid/repo.git ${cloneTarget}`, f.workspace);
+    assert.equal(clone.decision, "allow");
+    assert.deepEqual(clone.creationCandidates, [cloneTarget]);
+    assert.equal(
+      f.analyzer.analyzeCommand(`git clone ${join(f.workspace, ".env")} ${join(f.workspace, "secret-clone")}`, f.workspace).decision,
+      "deny",
+    );
+    mkdirSync(join(f.workspace, "existing-clone"));
+    assert.equal(
+      f.analyzer.analyzeCommand(`git clone https://example.invalid/repo.git ${join(f.workspace, "existing-clone")}`, f.workspace).decision,
+      "ask",
+    );
     assert.equal(f.analyzer.analyzeCommand("git show HEAD:.env", f.workspace).decision, "deny");
     assert.equal(f.analyzer.analyzeCommand("git log -- .env", f.workspace).decision, "deny");
     assert.equal(f.analyzer.analyzeCommand("git push --force origin main", f.workspace).decision, "deny");
@@ -554,6 +608,16 @@ test("common shell grammar and builtins are recognized", () => {
     assert.equal(f.analyzer.analyzeCommand("set -e", f.workspace).decision, "allow");
     assert.equal(f.analyzer.analyzeCommand("{ echo safe; }", f.workspace).decision, "allow");
     assert.equal(f.analyzer.analyzeCommand("if true; then echo safe; fi", f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand("trap 'echo safe' EXIT", f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand("trap -p EXIT", f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand("trap 'unknown-deferred-command' EXIT", f.workspace).decision, "ask");
+    assert.equal(f.analyzer.analyzeCommand("builtin printf safe", f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand("builtin eval unknown-deferred-command", f.workspace).decision, "ask");
+    assert.equal(f.analyzer.analyzeCommand("let 'value = 1 + 2'", f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand("getopts ab option", f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand(`[[ -f ${join(f.workspace, "missing")} ]]`, f.workspace).decision, "allow");
+    writeFileSync(join(f.workspace, ".env"), "TOKEN=test\n");
+    assert.equal(f.analyzer.analyzeCommand(`[[ -f ${join(f.workspace, ".env")} ]]`, f.workspace).decision, "deny");
   } finally { f.cleanup(); }
 });
 

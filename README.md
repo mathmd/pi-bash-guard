@@ -6,17 +6,18 @@ A local Pi extension that combines shell hazard detection with explicit path own
 
 - Existing unowned paths are readable unless secret; modifying or executing them asks once. Known-missing literal paths do not require ownership, while protected policy, secret, `.git`, and system locations retain their safety rules.
 - Pi-created paths receive edit ownership until the agent becomes idle.
-- Pi-created paths under `/tmp` retain edit ownership for the Pi session.
+- Pi-created paths under `/tmp` retain edit ownership for the Pi session. Runtime names containing `$$` are discovered after successful creation so later cleanup can use that same ownership.
 - Git-tracked regular files automatically receive edit ownership when the working directory is the repository root, any nested subdirectory, or a symlink resolving into either; tracked files currently deleted from the worktree are included.
 - Edit ownership permits modification/deletion, execute ownership permits execution without editing, and full ownership combines both capabilities.
 - Secret reads, catastrophic commands, direct `.git` writes, and irreversible unowned deletion are denied.
-- Remote mutations and mutative Git/systemd commands always ask; filesystem searches, systemd inspection, documented `nix-store` queries, conservative modern Nix inspection commands, Hyprland information commands, HTTP GET/HEAD requests, common network diagnostics, and read-only IPP attribute queries do not.
+- Remote mutations and mutative Git/systemd commands always ask. A clone into a new `/tmp` destination is treated as remote read plus attributable local creation; filesystem searches, systemd inspection, documented Nix inspections, Hyprland information commands, HTTP GET/HEAD requests, common network diagnostics, and read-only IPP attribute queries also do not ask.
 - Wrappers such as `timeout` inherit the classification of the command they run.
 - Shell `command -v`/`command -V` inspection is non-executing and does not treat the queried name as a command; other `command` forms still inherit the wrapped command’s classification.
+- `trap` inspection/reset forms are safe, while a deferred trap action is recursively analyzed as shell. Common state-only builtins such as `let`, `getopts`, `caller`, and `times`, `builtin` wrappers, and `[[ … ]]` tests are recognized.
 - Shell interpreter `-c` source is analyzed recursively as shell; inline JavaScript, Python, Ruby, Perl, Lua/LuaJIT, Deno, and Bun source is treated as opaque code requiring approval rather than misparsed as shell. `luac -p` is treated as read-only syntax checking.
 - Command substitutions (`$(…)` and backticks) are analyzed recursively, while their resulting text is treated as data in the surrounding command rather than as additional shell syntax.
-- Persistent shell assignments are resolved across compound commands and their static values are shown in relevant permission details; copy operations check concrete destination files rather than requiring ownership of the destination directory.
-- Variables from literal assignments and literal `for … in …` lists are resolved statically, including path-position loop variables; dynamic values remain unresolved and are labeled explicitly.
+- Persistent shell assignments are propagated across compound commands. Literal values remain concrete; `mktemp` output and path values containing `$$` receive stable symbolic descriptions instead of being mislabeled unresolved. Copy operations check concrete destination files rather than only destination directories.
+- Variables from literal assignments and literal `for … in …` lists are resolved statically, including path-position loop variables. Other dynamic values remain unresolved and are labeled explicitly.
 - Unquoted shell globs are expanded against the working directory before path policy checks. Permission details list each concrete match; unresolved or over-limit expansions fail closed instead of creating wildcard-shaped ownership entries.
 - Path inference recognizes whole path arguments, not slash-containing code snippets, quoted source text, command strings, URLs, or other embedded text.
 - Headless sessions block anything that would ask.

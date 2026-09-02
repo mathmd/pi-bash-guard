@@ -23,7 +23,8 @@ export function shellBindingDetails(unit: CommandAnalysisUnit): string {
   }
   const resolved = unit.resolvedBindings?.filter(({ name }) => !executableNames.has(name)) ?? [];
   if (resolved.length) {
-    sections.push(`Resolved shell variable${resolved.length === 1 ? "" : "s"}:\n${resolved.map(({ name, value }) => `$${name} = ${JSON.stringify(value)}`).join("\n")}`);
+    sections.push(`Resolved shell variable${resolved.length === 1 ? "" : "s"}:\n${resolved.map(({ name, value, symbolic }) =>
+      `$${name} = ${symbolic ? `<${symbolic}>` : JSON.stringify(value)}`).join("\n")}`);
   }
   for (const expansion of unit.analysis.pathExpansions ?? []) {
     const values = expansion.unresolved

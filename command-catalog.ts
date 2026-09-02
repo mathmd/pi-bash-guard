@@ -6,11 +6,12 @@ export const SHELL_PREFIX_WORDS = new Set([
 ]);
 
 export const SHELL_HEADER_WORDS = new Set(["for", "select", "while", "until", "case", "function"]);
-export const SHELL_CLOSING_WORDS = new Set(["fi", "done", "esac", "}"]);
+export const SHELL_CLOSING_WORDS = new Set(["fi", "done", "esac", "}", "]]"]);
 
 const ALLOW = new Set([
   // Shell state, introspection, and inert utilities.
   ":", "true", "false", "set", "shopt", "export", "readonly", "unset", "declare", "typeset", "local",
+  "let", "getopts", "caller", "times",
   "umask", "ulimit", "alias", "unalias", "hash", "help", "history", "jobs", "disown", "wait", "shift",
   "return", "break", "continue", "exit", "logout", "cd", "pushd", "popd", "dirs", "read", "readarray", "mapfile",
   "printf", "echo", "pwd", "basename", "dirname", "yes", "sleep", "seq",
@@ -21,7 +22,7 @@ const ALLOW = new Set([
 
 const READ = new Set([
   // Filesystem and text inspection.
-  "test", "[", "ls", "stat", "file", "wc", "cat", "tac", "head", "tail", "less", "more", "od", "hexdump", "xxd",
+  "test", "[", "[[", "ls", "stat", "file", "wc", "cat", "tac", "head", "tail", "less", "more", "od", "hexdump", "xxd",
   "strings", "cksum", "md5sum", "sha1sum", "sha224sum", "sha256sum", "sha384sum", "sha512sum", "b2sum",
   "grep", "egrep", "fgrep", "rg", "find", "fd", "locate", "which", "whereis", "type", "readlink",
   "realpath", "du", "df", "mountpoint", "lsblk", "lscpu", "lsmem", "lspci", "lsusb", "free", "vmstat",

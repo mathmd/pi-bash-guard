@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
+import { existsSync, globSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 
 export function expandHome(value: string, home: string): string {
@@ -41,6 +41,11 @@ export function pathExists(path: string): boolean {
   } catch {
     return false;
   }
+}
+
+export function matchingGlobPaths(pattern: string, limit = 10_000): Set<string> {
+  try { return new Set(globSync(pattern).slice(0, limit).map(canonicalPath)); }
+  catch { return new Set(); }
 }
 
 export function pathIsDirectory(path: string): boolean {

@@ -47,6 +47,7 @@ export interface Analysis {
   ownershipCandidates: Array<{ path: string; required: "edit" | "execute" | "full" }>;
   unknownCommands?: Array<{ name: string; arguments: string[] }>;
   pathExpansions?: PathExpansion[];
+  creationPatterns?: string[];
 }
 
 export interface PolicyIssue {

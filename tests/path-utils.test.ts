@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { canonicalPath, globToRegExp, isWithin, looksLikePath } from "../path-utils.ts";
+import { canonicalPath, globToRegExp, isWithin, looksLikePath, matchingGlobPaths } from "../path-utils.ts";
 
 test("canonical path follows fixture-local symlinks and preserves missing suffix", () => {
   const root = mkdtempSync(join(tmpdir(), "bash-guard-path-"));
@@ -19,6 +19,18 @@ test("canonical path follows fixture-local symlinks and preserves missing suffix
 test("glob supports recursive and single-component wildcards", () => {
   assert.equal(globToRegExp("/fixture/**/file?.txt").test("/fixture/a/b/file1.txt"), true);
   assert.equal(globToRegExp("/fixture/*.txt").test("/fixture/a/file.txt"), false);
+});
+
+test("glob snapshots identify newly created runtime paths", () => {
+  const root = mkdtempSync(join(tmpdir(), "bash-guard-runtime-glob-"));
+  try {
+    const pattern = join(root, "repo-[0-9]*");
+    const before = matchingGlobPaths(pattern);
+    const created = join(root, "repo-12345");
+    mkdirSync(created);
+    const newlyCreated = [...matchingGlobPaths(pattern)].filter((path) => !before.has(path));
+    assert.deepEqual(newlyCreated, [created]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("path recognition rejects embedded code and URLs without rejecting real paths", () => {

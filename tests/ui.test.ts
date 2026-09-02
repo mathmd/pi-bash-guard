@@ -68,6 +68,20 @@ test("permission details show statically resolved shell values", () => {
   );
 });
 
+test("permission details describe symbolic runtime paths without exposing markers", () => {
+  const details = shellBindingDetails({
+    command: 'git clone URL "$tmp/repo"',
+    analysis: { decision: "ask", reasons: [], accesses: [], creationCandidates: [], trashablePaths: [], ownershipCandidates: [] },
+    resolvedBindings: [{
+      name: "tmp",
+      value: "/tmp/.bash-guard-mktemp-tmp-marker",
+      symbolic: "runtime directory created by mktemp under /tmp",
+    }],
+  });
+  assert.match(details, /\$tmp = <runtime directory created by mktemp under \/tmp>/);
+  assert.doesNotMatch(details, /\.bash-guard-mktemp/);
+});
+
 test("permission details list concrete shell glob matches", () => {
   const details = shellBindingDetails({
     command: "unknown-inspector scripts/*.lua",

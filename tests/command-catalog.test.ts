@@ -6,6 +6,9 @@ test("common shell and Unix commands have conservative categories", () => {
   assert.equal(builtinCommandCategory("cd"), "allow");
   assert.equal(builtinCommandCategory("exit"), "allow");
   assert.equal(builtinCommandCategory("set"), "allow");
+  assert.equal(builtinCommandCategory("let"), "allow");
+  assert.equal(builtinCommandCategory("getopts"), "allow");
+  assert.equal(builtinCommandCategory("[["), "read");
   assert.equal(builtinCommandCategory("ping"), "allow");
   assert.equal(builtinCommandCategory("tee"), "edit");
   assert.equal(builtinCommandCategory("cat"), "read");
@@ -20,5 +23,6 @@ test("shell structural words are distinguished from closing words", () => {
   assert.equal(SHELL_PREFIX_WORDS.has("if"), true);
   assert.equal(SHELL_PREFIX_WORDS.has("then"), true);
   assert.equal(SHELL_CLOSING_WORDS.has("fi"), true);
+  assert.equal(SHELL_CLOSING_WORDS.has("]]"), true);
   assert.equal(SHELL_CLOSING_WORDS.has("then"), false);
 });
