@@ -1,14 +1,19 @@
 import { createHash } from "node:crypto";
 import { globSync, lstatSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, dirname, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parse as shellParse, quote as shellQuote, type ParseToken } from "shell-quote";
 import type { AccessKind, Analysis, CommandCategory, Decision, PathAccess, PathExpansion } from "./types.ts";
 import { strongest } from "./types.ts";
 import { catastrophicInvocation, catastrophicTextReason, containsUnquotedForkBomb } from "./catastrophic-screening.ts";
+import { informationalInvocation } from "./informational-commands.ts";
 import { canonicalPath, containsGitMetadata, expandHome, isWithin, looksLikePath, pathExists, pathIsDirectory, resolvePath } from "./path-utils.ts";
 import { javascriptExecutions } from "./javascript-screening.ts";
 import { selectNodeTestFiles } from "./node-test-selection.ts";
 import { selectNpmScripts } from "./npm-scripts.ts";
+import { pythonOperations } from "./python-screening.ts";
+import { displayHeredocOperators, extractShellHeredocs, heredocHasDynamicExpansion, isHeredocMarker, type ShellHeredoc } from "./shell-heredoc.ts";
+import type { SourceScreening } from "./source-operations.ts";
 import type { PolicyStore } from "./policy.ts";
 import { builtinCommandCategory, SHELL_CLOSING_WORDS, SHELL_HEADER_WORDS, SHELL_PREFIX_WORDS } from "./command-catalog.ts";
 
@@ -243,6 +248,21 @@ function classifyCurl(args: string[]): CurlClassification {
   const safeMethod = !method || ["GET", "HEAD", "OPTIONS"].includes(method);
   return { readOnly: safeMethod && !mutativePayload && !opaqueConfig && (!hasData || queryMode), outputs };
 }
+function sedInPlaceTargets(args: string[]): string[] {
+  const targets: string[] = [];
+  let hasProgram = false;
+  for (let index = 0; index < args.length; index++) {
+    const argument = args[index]!;
+    if (["-e", "--expression", "-f", "--file"].includes(argument)) { hasProgram = true; index++; continue; }
+    if (/^(?:-e|-f).+/.test(argument) || argument.startsWith("--expression=") || argument.startsWith("--file=")) { hasProgram = true; continue; }
+    if (argument === "-i" || argument === "--in-place" || argument.startsWith("-i") || argument.startsWith("--in-place=")) continue;
+    if (argument.startsWith("-")) continue;
+    if (!hasProgram) { hasProgram = true; continue; }
+    targets.push(argument);
+  }
+  return targets;
+}
+
 
 
 const XARGS_VALUE_OPTIONS = new Set([
@@ -662,6 +682,98 @@ function hasOpaqueInlineCode(command: string, args: string[]): boolean {
   return false;
 }
 
+interface ExplicitInlineSource { requested: boolean; source?: string; }
+
+function explicitInlineSource(command: string, args: string[]): ExplicitInlineSource {
+  for (let index = 0; index < args.length; index++) {
+    const argument = args[index]!;
+    if (command === "node") {
+      if (["-e", "--eval", "-p", "--print"].includes(argument) || /^-[ep]+$/.test(argument)) {
+        return { requested: true, source: args[index + 1] };
+      }
+      const long = argument.match(/^--(?:eval|print)=(.*)$/s);
+      if (long) return { requested: true, source: long[1] };
+      const short = argument.match(/^-[ep](.+)$/s);
+      if (short) return { requested: true, source: short[1] };
+    } else if (["python", "python3"].includes(command)) {
+      if (argument === "-c") return { requested: true, source: args[index + 1] };
+      if (argument.startsWith("-c") && argument.length > 2) return { requested: true, source: argument.slice(2) };
+    } else return { requested: false };
+    if (argument === "--" || !argument.startsWith("-")) break;
+  }
+  return { requested: false };
+}
+
+function interpreterReadsStdin(command: string, args: string[]): boolean {
+  if (command === "node") {
+    if (args.some((argument) => argument === "--test" || argument.startsWith("--test="))) return false;
+    const valueOptions = new Set(["--input-type", "--conditions", "--experimental-loader", "--import", "--loader", "--require", "-C", "-r"]);
+    for (let index = 0; index < args.length; index++) {
+      const argument = args[index]!;
+      if (argument === "--") return args[index + 1] === "-" || args[index + 1] === undefined;
+      if (valueOptions.has(argument)) { index++; continue; }
+      if ([...valueOptions].some((option) => option.startsWith("--") && argument.startsWith(`${option}=`))) continue;
+      if (argument === "-") return true;
+      if (!argument.startsWith("-")) return false;
+    }
+    return true;
+  }
+  if (["python", "python3"].includes(command)) {
+    const valueOptions = new Set(["-W", "-X"]);
+    for (let index = 0; index < args.length; index++) {
+      const argument = args[index]!;
+      if (["-c", "-m"].includes(argument) || /^-[cm].+/.test(argument)) return false;
+      if (argument === "--") return args[index + 1] === "-" || args[index + 1] === undefined;
+      if (valueOptions.has(argument)) { index++; continue; }
+      if (argument === "-") return true;
+      if (!argument.startsWith("-")) return false;
+    }
+    return true;
+  }
+  if (SHELL_INTERPRETERS.has(command)) {
+    if (args.some((argument) => argument === "-c" || /^-[^-]*c/.test(argument))) return false;
+    return !args.some((argument) => !argument.startsWith("-") && argument !== "-") || args.includes("-s") || args.includes("-");
+  }
+  return false;
+}
+
+function interpreterScriptArgument(command: string, args: string[]): string | undefined {
+  const valueOptions = command === "node"
+    ? new Set(["--conditions", "--diagnostic-dir", "--experimental-loader", "--input-type", "--import", "--loader", "--redirect-warnings", "--require", "-C", "-r"])
+    : ["python", "python3"].includes(command) ? new Set(["-W", "-X"]) : new Set<string>();
+  for (let index = 0; index < args.length; index++) {
+    const argument = args[index]!;
+    if (argument === "--") return args[index + 1] === "-" ? undefined : args[index + 1];
+    if (valueOptions.has(argument)) { index++; continue; }
+    if ([...valueOptions].some((option) => option.startsWith("--") && argument.startsWith(`${option}=`))) continue;
+    if (argument === "-") return undefined;
+    if (!argument.startsWith("-")) return argument;
+  }
+  return undefined;
+}
+
+interface NodePreload { value?: string; source: string; }
+
+function nodePreloads(args: string[]): NodePreload[] {
+  const options = new Map([
+    ["-r", "node --require"], ["--require", "node --require"],
+    ["--import", "node --import"], ["--loader", "node --loader"], ["--experimental-loader", "node --experimental-loader"],
+  ]);
+  const preloads: NodePreload[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const argument = args[index]!;
+    const source = options.get(argument);
+    if (source) { preloads.push({ value: args[++index], source }); continue; }
+    for (const [option, label] of options) {
+      if (option.startsWith("--") && argument.startsWith(`${option}=`)) {
+        preloads.push({ value: argument.slice(option.length + 1), source: label });
+        break;
+      }
+    }
+  }
+  return preloads;
+}
+
 function recursiveCopyTargets(source: string, destination: string, limit = 10_000): string[] {
   const targets: string[] = [];
   const walk = (sourcePath: string, destinationPath: string): void => {
@@ -681,21 +793,35 @@ function recursiveCopyTargets(source: string, destination: string, limit = 10_00
     return [destination];
   }
 }
-type ScriptLanguage = "shell" | "javascript" | "other";
-
-interface ScriptScreeningResult {
-  decision: "ask" | "deny";
-  reason: string;
-}
+type ScriptLanguage = "shell" | "javascript" | "python" | "other";
 
 function scriptLanguage(path: string, interpreter: string | undefined, source: string): ScriptLanguage {
   if (interpreter && SHELL_INTERPRETERS.has(interpreter)) return "shell";
   if (interpreter && ["node", "deno", "bun"].includes(interpreter)) return "javascript";
+  if (interpreter && ["python", "python3"].includes(interpreter)) return "python";
   if (/\.(?:[cm]?[jt]s)$/i.test(path)) return "javascript";
+  if (/\.py(?:w)?$/i.test(path)) return "python";
   const shebang = source.split("\n", 1)[0] ?? "";
   if (/^#!.*\b(?:ba|z|fi)?sh\b/.test(shebang)) return "shell";
   if (/^#!.*\b(?:node|deno|bun)\b/.test(shebang)) return "javascript";
+  if (/^#!.*\bpython(?:3(?:\.\d+)?)?\b/.test(shebang)) return "python";
   return "other";
+}
+
+function combineAnalyses(items: Analysis[]): Analysis {
+  return items.reduce<Analysis>((result, item) => ({
+    decision: strongest(result.decision, item.decision),
+    reasons: [...new Set([...result.reasons, ...item.reasons])],
+    accesses: [...result.accesses, ...item.accesses],
+    creationCandidates: [...new Set([...result.creationCandidates, ...item.creationCandidates])],
+    // Nested script deletion cannot safely be rewritten as a standalone trash command.
+    trashablePaths: [],
+    ownershipCandidates: [...result.ownershipCandidates, ...item.ownershipCandidates].filter((candidate, index, all) =>
+      all.findIndex((other) => other.path === candidate.path && other.required === candidate.required) === index),
+    unknownCommands: [...(result.unknownCommands ?? []), ...(item.unknownCommands ?? [])],
+    pathExpansions: [...(result.pathExpansions ?? []), ...(item.pathExpansions ?? [])],
+    creationPatterns: [...new Set([...(result.creationPatterns ?? []), ...(item.creationPatterns ?? [])])],
+  }), { decision: "allow", reasons: [], accesses: [], creationCandidates: [], trashablePaths: [], ownershipCandidates: [] });
 }
 
 export class GuardAnalyzer {
@@ -711,11 +837,34 @@ export class GuardAnalyzer {
     return canonicalPath(resolvePath(raw, cwd, this.policy.home));
   }
 
-  private executableVariableNames(command: string, cwd: string, environment: ShellEnvironment, generatedPaths: GeneratedPathEnvironment): string[] {
+  private modulePath(raw: string, base: string, language: "javascript" | "python" = "javascript"): string {
+    let candidate: string;
+    try { candidate = raw.startsWith("file:") ? canonicalPath(fileURLToPath(raw)) : this.path(raw, base); }
+    catch { return this.path(raw, base); }
+    if (pathExists(candidate) && !pathIsDirectory(candidate)) return candidate;
+    const suffixes = language === "python" ? [".py"] : [".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".json"];
+    for (const suffix of suffixes) {
+      if (pathExists(`${candidate}${suffix}`)) return canonicalPath(`${candidate}${suffix}`);
+    }
+    const names = language === "python" ? ["__init__.py"] : ["index.js", "index.mjs", "index.cjs", "index.ts", "index.mts", "index.cts", "index.json"];
+    for (const name of names) {
+      const nested = join(candidate, name);
+      if (pathExists(nested)) return canonicalPath(nested);
+    }
+    return candidate;
+  }
+
+  private executableVariableNames(
+    command: string,
+    cwd: string,
+    environment: ShellEnvironment,
+    generatedPaths: GeneratedPathEnvironment,
+    heredocs: Map<string, ShellHeredoc>,
+  ): string[] {
     const executableNames: string[] = [];
     for (const name of referencedShellVariables(command)) {
       const marker = `__bash_guard_variable_${name}__`;
-      const probe = this.analyzeCommand(command, cwd, { ...environment, [name]: marker }, generatedPaths);
+      const probe = this.analyzeCommand(command, cwd, { ...environment, [name]: marker }, generatedPaths, heredocs);
       const isCommand = probe.reasons.some((reason) => reason.startsWith("Unknown command ") && reason.includes(marker));
       const isExecutionTarget = probe.accesses.some((access) => access.kind === "execute" &&
         (access.source?.includes(marker) || access.path.includes(marker)));
@@ -725,6 +874,11 @@ export class GuardAnalyzer {
   }
 
   analyzeCommandUnits(command: string, cwd: string): CommandAnalysisUnit[] {
+    const extracted = extractShellHeredocs(command);
+    if (extracted.error) {
+      return [{ command, analysis: this.result("ask", [extracted.error]) }];
+    }
+    command = extracted.command;
     const environment: ShellEnvironment = {};
     const candidates = new Map<string, string[]>();
     const generatedPaths: GeneratedPathEnvironment = new Map();
@@ -733,19 +887,20 @@ export class GuardAnalyzer {
     let workingDirectory = cwd;
     for (const entry of splitShellCommandEntries(command)) {
       const unit = entry.command;
+      const displayUnit = displayHeredocOperators(unit, extracted.heredocs);
       const unitCwd = workingDirectory;
       const resultStart = results.length;
       const generated = generatedPathAssignment(unit, unitCwd, this.policy.home, environment);
       const loop = staticLoopBinding(unit, environment, this.policy.home, unitCwd);
       if (loop) {
-        results.push({ command: unit, analysis: this.analyzeCommand(unit, unitCwd, environment, generatedPaths) });
+        results.push({ command: displayUnit, analysis: this.analyzeCommand(unit, unitCwd, environment, generatedPaths, extracted.heredocs) });
         loops.push({ name: loop.name, values: loop.values, previous: candidates.get(loop.name) });
         candidates.set(loop.name, loop.values);
         continue;
       }
 
       const referencedNames = referencedShellVariables(unit);
-      const executableNames = this.executableVariableNames(unit, unitCwd, environment, generatedPaths);
+      const executableNames = this.executableVariableNames(unit, unitCwd, environment, generatedPaths, extracted.heredocs);
       const expansionNames = [...new Set([...executableNames, ...referencedNames.filter((name) => candidates.has(name))])];
       let contexts: Array<{ environment: ShellEnvironment; bindings: Array<{ name: string; value?: string }> }> = [
         { environment: { ...environment }, bindings: [] },
@@ -779,7 +934,7 @@ export class GuardAnalyzer {
       }
 
       for (const context of contexts) {
-        const analysis = this.analyzeCommand(unit, unitCwd, context.environment, generatedPaths);
+        const analysis = this.analyzeCommand(unit, unitCwd, context.environment, generatedPaths, extracted.heredocs);
         if (generated) {
           const safety = this.finalize([], [generated.binding.path], [], [], generatedPaths);
           analysis.decision = strongest(analysis.decision, safety.decision);
@@ -800,7 +955,7 @@ export class GuardAnalyzer {
           return value !== undefined && isStaticallyResolvedValue(value) ? [{ name, value, ...(symbolic ? { symbolic } : {}) }] : [];
         });
         results.push({
-          command: unit,
+          command: displayUnit,
           analysis,
           ...(context.bindings.some(({ name }) => executableNames.includes(name))
             ? { executableBindings: context.bindings.filter(({ name }) => executableNames.includes(name)) }
@@ -861,6 +1016,7 @@ export class GuardAnalyzer {
     cwd: string,
     shellEnvironment: ShellEnvironment = {},
     generatedPaths: GeneratedPathEnvironment = new Map(),
+    heredocs: Map<string, ShellHeredoc> = new Map(),
   ): Analysis {
     const substitutions = maskCommandSubstitutions(command);
     if (containsUnquotedForkBomb(substitutions.command)) {
@@ -927,6 +1083,12 @@ export class GuardAnalyzer {
           const target = segment[i + 1];
           if (typeof target === "string") {
             const descriptorTarget = [">&", "<&"].includes(token.op) && /^(?:\d+|-)$/.test(target);
+            if (token.op !== "<<<" && !descriptorTarget && !isStaticallyResolvedValue(target)) {
+              baseDecision = strongest(baseDecision, "ask");
+              reasons.push(`Dynamic redirection target cannot be resolved statically: ${target}`);
+              i++;
+              continue;
+            }
             const lexicalPath = resolvePath(target, cwd, this.policy.home);
             if (token.op !== "<<<" && !descriptorTarget && !this.policy.isSafeProcessIoPath(lexicalPath)) {
               const path = this.path(target, cwd);
@@ -940,7 +1102,8 @@ export class GuardAnalyzer {
         }
         if (typeof token === "string") commandWords.push(token);
       }
-      const strings = commandWords;
+      const heredocInputs = commandWords.filter((word) => isHeredocMarker(word) && heredocs.has(word)).map((marker) => heredocs.get(marker)!);
+      const strings = commandWords.filter((word) => !(isHeredocMarker(word) && heredocs.has(word)));
       if (!strings.length) continue;
       let index = 0;
       while (index < strings.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(strings[index])) index++;
@@ -994,6 +1157,14 @@ export class GuardAnalyzer {
       if (!executableRaw) continue;
       const cmd = commandName(executableRaw);
       const args = strings.slice(index + 1).filter((arg) => !REDIRECT_OPS.has(arg));
+      for (const heredoc of heredocInputs.filter((item) => !item.quotedDelimiter)) {
+        const expanded = maskCommandSubstitutions(heredoc.source);
+        for (const source of expanded.sources) mergeNested(this.analyzeCommand(source, cwd, shellEnvironment, generatedPaths));
+        if (heredocHasDynamicExpansion(heredoc)) {
+          baseDecision = strongest(baseDecision, "ask");
+          reasons.push("Unquoted heredoc expansion cannot be resolved statically");
+        }
+      }
       for (const arg of args) {
         if (isStaticallyResolvedValue(arg) || !arg.includes("/") || /^(?:[A-Za-z][A-Za-z0-9+.-]*):\/\//.test(arg) || unresolvedPathArguments.has(arg)) continue;
         unresolvedPathArguments.add(arg);
@@ -1003,6 +1174,23 @@ export class GuardAnalyzer {
       }
       const catastrophic = catastrophicInvocation(cmd, args, cwd, this.policy.home);
       if (catastrophic) return this.result("deny", [`Catastrophic operation: ${catastrophic}`]);
+      const informational = informationalInvocation(cmd, args);
+      if (informational.handled) {
+        if (executableRaw.includes("/")) {
+          const executable = this.path(executableRaw, cwd);
+          accesses.push({ path: executable, kind: "execute", source: `${cmd} information`, literal: isLiteralShellPath(executableRaw), existed: pathExists(executable) });
+          mergeNested(this.screenScript(executable, cwd));
+        }
+        for (const path of informational.readPaths) {
+          if (!isStaticallyResolvedValue(path)) {
+            baseDecision = strongest(baseDecision, "ask");
+            reasons.push(`Dynamic informational read path cannot be checked safely: ${path}`);
+            continue;
+          }
+          accesses.push({ path: this.path(path, cwd), kind: "read", source: `${cmd} information`, literal: isLiteralShellPath(path), existed: pathExists(this.path(path, cwd)) });
+        }
+        continue;
+      }
       const pathLikeArgument = (value: string): boolean => !unresolvedPathArguments.has(value) &&
         (unmatchedGlobArguments.has(value) || looksLikePath(value) || pathExists(this.path(value, cwd)));
       const argumentAccess = (value: string, kind: AccessKind, source: string): PathAccess => {
@@ -1126,6 +1314,11 @@ export class GuardAnalyzer {
         }
         for (const output of classification.outputs) {
           if (output === "-") continue;
+          if (!isStaticallyResolvedValue(output)) {
+            baseDecision = strongest(baseDecision, "ask");
+            reasons.push(`Dynamic curl output cannot be resolved statically: ${output}`);
+            continue;
+          }
           const lexicalOutput = resolvePath(output, cwd, this.policy.home);
           if (this.policy.isSafeProcessIoPath(lexicalOutput)) continue;
           const path = this.path(output, cwd);
@@ -1159,7 +1352,13 @@ export class GuardAnalyzer {
       }
 
       if (cmd === "rm" || cmd === "rmdir" || cmd === "unlink") {
-        for (const arg of args.filter((value) => !value.startsWith("-") && pathLikeArgument(value))) {
+        for (const arg of args.filter((value) => !value.startsWith("-"))) {
+          if (!isStaticallyResolvedValue(arg)) {
+            baseDecision = strongest(baseDecision, "ask");
+            reasons.push(`Dynamic deletion target cannot be resolved statically: ${arg}`);
+            continue;
+          }
+          if (!pathLikeArgument(arg)) continue;
           const access = argumentAccess(arg, "delete", cmd);
           accesses.push(access);
           if (access.literal) trashable.push(access.path);
@@ -1169,6 +1368,11 @@ export class GuardAnalyzer {
 
       if (["touch", "mkdir", "mktemp"].includes(cmd)) {
         for (const arg of args.filter((value) => !value.startsWith("-"))) {
+          if (!isStaticallyResolvedValue(arg)) {
+            baseDecision = strongest(baseDecision, "ask");
+            reasons.push(`Dynamic creation target cannot be resolved statically: ${arg}`);
+            continue;
+          }
           const path = this.path(arg, cwd);
           if (pathExists(path)) accesses.push({ path, kind: "edit", source: cmd, literal: true, existed: true });
           else creations.push(path);
@@ -1178,6 +1382,11 @@ export class GuardAnalyzer {
 
       if (cmd === "tee") {
         for (const arg of args.filter((value) => !value.startsWith("-"))) {
+          if (!isStaticallyResolvedValue(arg)) {
+            baseDecision = strongest(baseDecision, "ask");
+            reasons.push(`Dynamic tee target cannot be resolved statically: ${arg}`);
+            continue;
+          }
           const path = this.path(arg, cwd);
           if (pathExists(path)) accesses.push({ path, kind: "edit", source: "tee", literal: true, existed: true });
           else creations.push(path);
@@ -1187,6 +1396,11 @@ export class GuardAnalyzer {
 
       if (cmd === "cp" || cmd === "install") {
         const positional = args.filter((value) => !value.startsWith("-"));
+        if (positional.some((value) => !isStaticallyResolvedValue(value))) {
+          baseDecision = strongest(baseDecision, "ask");
+          reasons.push(`Dynamic ${cmd} path cannot be resolved statically`);
+          continue;
+        }
         if (positional.length >= 2) {
           const sourceArgs = positional.slice(0, -1);
           const destinationArg = positional.at(-1)!;
@@ -1215,7 +1429,14 @@ export class GuardAnalyzer {
 
       if (cmd === "mv") {
         const positional = args.filter((value) => !value.startsWith("-"));
-        for (const value of positional) accesses.push({ path: this.path(value, cwd), kind: "edit", source: cmd, literal: isLiteralShellPath(value), existed: pathExists(this.path(value, cwd)) });
+        for (const value of positional) {
+          if (!isStaticallyResolvedValue(value)) {
+            baseDecision = strongest(baseDecision, "ask");
+            reasons.push(`Dynamic mv path cannot be resolved statically: ${value}`);
+            continue;
+          }
+          accesses.push({ path: this.path(value, cwd), kind: "edit", source: cmd, literal: true, existed: pathExists(this.path(value, cwd)) });
+        }
         continue;
       }
 
@@ -1231,6 +1452,11 @@ export class GuardAnalyzer {
 
       if (cmd === "find" && args.some((arg) => ["-delete", "-exec", "-execdir", "-ok", "-okdir"].includes(arg))) {
         const root = args[0] && !args[0].startsWith("-") ? args[0] : ".";
+        if (!isStaticallyResolvedValue(root)) {
+          baseDecision = strongest(baseDecision, "ask");
+          reasons.push(`Dynamic find root cannot be resolved statically: ${root}`);
+          continue;
+        }
         if (args.includes("-delete")) {
           accesses.push({ path: this.path(root, cwd), kind: "delete", source: "find", literal: false, existed: pathExists(this.path(root, cwd)) });
         } else {
@@ -1252,8 +1478,14 @@ export class GuardAnalyzer {
 
       const perlInPlace = cmd === "perl" && args.some((arg) => /^-[^-]*i/.test(arg) || arg === "--in-place" || arg.startsWith("--in-place="));
       if ((cmd === "sed" && args.some((arg) => arg === "-i" || arg.startsWith("-i"))) || perlInPlace) {
-        for (const value of args.filter((arg) => !arg.startsWith("-") && looksLikePath(arg))) {
-          accesses.push({ path: this.path(value, cwd), kind: "edit", source: cmd, literal: isLiteralShellPath(value), existed: pathExists(this.path(value, cwd)) });
+        const targets = cmd === "sed" ? sedInPlaceTargets(args) : args.filter((arg) => !arg.startsWith("-") && (looksLikePath(arg) || pathExists(this.path(arg, cwd))));
+        for (const value of targets) {
+          if (!isStaticallyResolvedValue(value)) {
+            baseDecision = strongest(baseDecision, "ask");
+            reasons.push(`Dynamic ${cmd} in-place target cannot be resolved statically: ${value}`);
+            continue;
+          }
+          accesses.push({ path: this.path(value, cwd), kind: "edit", source: cmd, literal: true, existed: pathExists(this.path(value, cwd)) });
         }
         if (cmd === "sed") continue;
       }
@@ -1269,7 +1501,30 @@ export class GuardAnalyzer {
       }
 
       if (INTERPRETERS.has(cmd)) {
-        if (cmd === "node" && !hasOpaqueInlineCode(cmd, args)) {
+        const explicit = explicitInlineSource(cmd, args);
+        if (cmd === "node" && !args.some((argument) => argument === "--test" || argument.startsWith("--test="))) {
+          for (const preload of nodePreloads(args)) {
+            if (preload.value === undefined || !isStaticallyResolvedValue(preload.value) || /^(?:data|https?):/i.test(preload.value)) {
+              baseDecision = strongest(baseDecision, "ask");
+              reasons.push(`${preload.source} target cannot be resolved safely`);
+              continue;
+            }
+            if (!looksLikePath(preload.value) && !preload.value.startsWith("file:")) continue;
+            const path = this.modulePath(preload.value, cwd, "javascript");
+            accesses.push({ path, kind: "execute", source: preload.source, literal: true, existed: pathExists(path) });
+            if (pathExists(path)) mergeNested(this.screenScript(path, cwd, "node"));
+          }
+        }
+        if (explicit.requested && ["node", "python", "python3"].includes(cmd)) {
+          if (explicit.source === undefined) {
+            baseDecision = strongest(baseDecision, "ask");
+            reasons.push(`${cmd} inline source could not be resolved`);
+          } else {
+            mergeNested(this.screenSource(explicit.source, cmd === "node" ? "javascript" : "python", cwd, `inline ${cmd} source`));
+          }
+          continue;
+        }
+        if (cmd === "node") {
           const tests = selectNodeTestFiles(args, cwd);
           if (tests.enabled) {
             if (tests.truncated) {
@@ -1288,11 +1543,7 @@ export class GuardAnalyzer {
             for (const selected of new Set([...tests.supportFiles, ...tests.files])) {
               const path = this.path(selected, cwd);
               accesses.push({ path, kind: "execute", source: "node --test", literal: true, existed: pathExists(path) });
-              const screening = this.screenScript(path, cwd, "node");
-              if (screening) {
-                baseDecision = strongest(baseDecision, screening.decision);
-                reasons.push(screening.reason);
-              }
+              mergeNested(this.screenScript(path, cwd, "node"));
             }
             continue;
           }
@@ -1301,39 +1552,60 @@ export class GuardAnalyzer {
           const cIndex = args.findIndex((arg) => arg === "-c" || /^-[^-]*c/.test(arg));
           if (cIndex >= 0) {
             const source = args[cIndex + 1];
-            if (source) {
-              mergeNested(this.analyzeCommand(source, cwd, shellEnvironment, generatedPaths));
-            } else {
+            if (source) mergeNested(this.screenSource(source, "shell", cwd, `inline ${cmd} source`));
+            else {
               baseDecision = strongest(baseDecision, "ask");
               reasons.push(`Shell interpreter ${cmd} has an unresolved inline command`);
             }
             continue;
           }
-        } else if (hasOpaqueInlineCode(cmd, args)) {
+        }
+        if (heredocInputs.length && interpreterReadsStdin(cmd, args)) {
+          const heredoc = heredocInputs.at(-1)!;
+          const language: ScriptLanguage = SHELL_INTERPRETERS.has(cmd) ? "shell" : cmd === "node" ? "javascript" : ["python", "python3"].includes(cmd) ? "python" : "other";
+          if (language === "other") {
+            baseDecision = strongest(baseDecision, "ask");
+            reasons.push(`Opaque ${cmd} heredoc source requires approval`);
+          } else mergeNested(this.screenSource(heredoc.source, language, cwd, `inline ${cmd} heredoc`));
+          continue;
+        }
+        if (["python", "python3"].includes(cmd)) {
+          const moduleIndex = args.findIndex((argument) => argument === "-m" || /^-m.+/.test(argument));
+          if (moduleIndex >= 0) {
+            const module = args[moduleIndex] === "-m" ? args[moduleIndex + 1] : args[moduleIndex]!.slice(2);
+            if (module && isStaticallyResolvedValue(module)) {
+              const path = this.modulePath(module.replaceAll(".", "/"), cwd, "python");
+              if (pathExists(path)) {
+                accesses.push({ path, kind: "execute", source: `${cmd} -m`, literal: true, existed: true });
+                mergeNested(this.screenScript(path, cwd, "python"));
+                continue;
+              }
+            }
+            baseDecision = strongest(baseDecision, "ask");
+            reasons.push(`${cmd} module execution requires approval`);
+            continue;
+          }
+        }
+        if (hasOpaqueInlineCode(cmd, args)) {
           baseDecision = strongest(baseDecision, "ask");
           reasons.push(`Opaque ${cmd} inline code requires approval`);
           continue;
         }
-        const script = args.find((arg) => !arg.startsWith("-"));
+        const script = interpreterScriptArgument(cmd, args);
         if (script) {
           const path = this.path(script, cwd);
           accesses.push({ path, kind: "execute", source: cmd, literal: isLiteralShellPath(script), existed: pathExists(path) });
-          const screening = this.screenScript(path, cwd, cmd);
-          if (screening) {
-            baseDecision = strongest(baseDecision, screening.decision);
-            reasons.push(screening.reason);
-          }
-        } else { baseDecision = strongest(baseDecision, "ask"); reasons.push(`Opaque ${cmd} execution requires approval`); }
+          mergeNested(this.screenScript(path, cwd, cmd));
+        } else {
+          baseDecision = strongest(baseDecision, "ask");
+          reasons.push(`Opaque ${cmd} execution requires approval`);
+        }
         continue;
       }
 
       if (executableRaw.includes("/")) {
         const executable = this.path(executableRaw, cwd);
-        const screening = this.screenScript(executable, cwd);
-        if (screening) {
-          baseDecision = strongest(baseDecision, screening.decision);
-          reasons.push(screening.reason);
-        }
+        mergeNested(this.screenScript(executable, cwd));
         if (this.policy.isSystemReadonlyPath(executable)) {
           const systemCategory = builtinCommandCategory(cmd);
           if (!systemCategory) {
@@ -1414,12 +1686,22 @@ export class GuardAnalyzer {
     if (category === "execute" && (command === "eval" || command === "source" || command === ".")) {
       if (command === "eval") return this.analyzeCommand(args.join(" "), cwd, shellEnvironment, generatedPaths);
       const script = args.find((arg) => !arg.startsWith("-"));
-      return script
-        ? this.analyzePathAccess(script, "execute", cwd, command)
-        : this.result("ask", [`${command} requires an execution target`]);
+      if (!script) return this.result("ask", [`${command} requires an execution target`]);
+      if (!isStaticallyResolvedValue(script)) return this.result("ask", [`Dynamic execution target cannot be resolved statically: ${script}`]);
+      return this.analyzePathAccess(script, "execute", cwd, command);
     }
 
-    const positional = args.filter((arg) => !arg.startsWith("-") && !unresolvedPathArguments.has(arg));
+    const rawPositional = args.filter((arg) => !arg.startsWith("-"));
+    const dynamicMutationTargets = rawPositional.filter((arg) => !isStaticallyResolvedValue(arg));
+    const requireStaticMutationTargets = (analysis: Analysis): Analysis => {
+      if (["create", "edit", "delete"].includes(category) && dynamicMutationTargets.length) {
+        analysis.decision = strongest(analysis.decision, "ask");
+        analysis.reasons.push(`${command} has dynamic mutation arguments that cannot be resolved statically: ${dynamicMutationTargets.join(", ")}`);
+      }
+      return analysis;
+    };
+    const positional = rawPositional.filter((arg) => !unresolvedPathArguments.has(arg) &&
+      (["create", "edit", "delete"].includes(category) ? isStaticallyResolvedValue(arg) : true));
     const pathArguments = positional.filter((arg) => unmatchedGlobArguments.has(arg) || looksLikePath(arg) || pathExists(this.path(arg, cwd)));
     const pathAccess = (arg: string, kind: AccessKind): PathAccess => {
       const unmatched = unmatchedGlobArguments.has(arg);
@@ -1437,15 +1719,15 @@ export class GuardAnalyzer {
         if (pathExists(path)) accesses.push({ path, kind: "edit", source: command, literal: true, existed: true });
         else creations.push(path);
       }
-      return this.finalize(accesses, creations, [], [], generatedPaths);
+      return requireStaticMutationTargets(this.finalize(accesses, creations, [], [], generatedPaths));
     }
     if (category === "edit") {
-      return this.finalize(pathArguments.map((arg) => pathAccess(arg, "edit")), [], [], [], generatedPaths);
+      return requireStaticMutationTargets(this.finalize(pathArguments.map((arg) => pathAccess(arg, "edit")), [], [], [], generatedPaths));
     }
     if (category === "delete") {
       const accesses = pathArguments.map((arg): PathAccess => pathAccess(arg, "delete"));
       const trashable = accesses.filter((item) => item.literal).map((item) => item.path);
-      return this.finalize(accesses, [], trashable, [], generatedPaths);
+      return requireStaticMutationTargets(this.finalize(accesses, [], trashable, [], generatedPaths));
     }
     // Execute-category tools may run arbitrary nested programs or build logic.
     const accesses = pathArguments.map((arg): PathAccess => pathAccess(arg, "execute"));
@@ -1454,68 +1736,133 @@ export class GuardAnalyzer {
     return result;
   }
 
-  private screenScript(path: string, cwd: string, interpreter?: string): ScriptScreeningResult | undefined {
-    if (!pathExists(path)) return undefined;
-    const key = canonicalPath(path);
-    if (this.screeningPaths.has(key)) return undefined;
-    this.screeningPaths.add(key);
-    try {
-      if (statSync(path).size > 262_144) {
-        return { decision: "ask", reason: `Executable source exceeds the 256 KiB inspection limit: ${path}` };
+  private sourceScreeningAnalysis(screening: SourceScreening, cwd: string, label: string, moduleBase = cwd): Analysis {
+    if (screening.parseError) {
+      return this.result("ask", [`${label} could not be inspected safely: ${screening.parseError}`]);
+    }
+    const accesses: PathAccess[] = [];
+    const creations: string[] = [];
+    const reasons: string[] = [];
+    let decision: Decision = "allow";
+    for (const operation of screening.paths) {
+      if (operation.path === undefined) {
+        decision = strongest(decision, "ask");
+        reasons.push(operation.kind === "read"
+          ? `Dynamic read path cannot be checked for secrets: ${operation.source}`
+          : `Dynamic mutative path cannot be resolved statically: ${operation.source}`);
+        continue;
       }
-      const text = readFileSync(path, { encoding: "utf8", flag: "r" }).slice(0, 262_144);
-      const language = scriptLanguage(path, interpreter, text);
-      if (language === "javascript") {
-        const screening = javascriptExecutions(text);
-        if (screening.parseError) {
-          return { decision: "ask", reason: `JavaScript/TypeScript source could not be inspected safely: ${path}` };
-        }
-        for (const execution of screening.executions) {
-          if (execution.kind === "module") {
-            const modulePath = this.path(execution.path, cwd);
-            if (!looksLikePath(execution.path) && !pathExists(modulePath)) continue;
-            const nested = this.screenScript(modulePath, cwd, "node");
-            if (nested) return nested;
-            continue;
-          }
-          const command = execution.kind === "shell"
-            ? execution.command
-            : shellQuote([execution.executable, ...execution.args]);
-          const nested = this.analyzeCommand(command, cwd);
-          if (nested.decision === "deny") {
-            return { decision: "deny", reason: `Prohibited executable script content: ${nested.reasons.join("; ")}` };
-          }
-        }
-      } else if (language === "shell") {
-        for (const unit of this.analyzeCommandUnits(text, cwd)) {
-          if (unit.analysis.decision === "deny") {
-            return { decision: "deny", reason: `Prohibited executable script content: ${unit.analysis.reasons.join("; ")}` };
-          }
-        }
-      } else {
-        const catastrophic = catastrophicTextReason(text);
-        if (catastrophic) return { decision: "deny", reason: `Prohibited script content: ${catastrophic}` };
+      const path = this.path(operation.path, cwd);
+      if (operation.kind === "read") {
+        accesses.push({ path, kind: "read", source: operation.source, literal: true, existed: pathExists(path) });
+      } else if (operation.kind === "delete") {
+        accesses.push({ path, kind: "delete", source: operation.source, literal: true, existed: pathExists(path) });
+      } else if (pathExists(path)) {
+        accesses.push({ path, kind: "edit", source: operation.source, literal: true, existed: true });
+      } else creations.push(path);
+    }
+    const analyses: Analysis[] = [this.finalize(accesses, creations, [], reasons)];
+    analyses[0]!.decision = strongest(analyses[0]!.decision, decision);
+    for (const execution of screening.executions) {
+      let executionCwd = execution.kind === "module" && execution.sourceRelative ? moduleBase : cwd;
+      if (execution.dynamicCwd) {
+        analyses.push(this.result("ask", [`Dynamic execution working directory cannot be resolved statically: ${execution.source}`]));
+      } else if (execution.cwd) executionCwd = this.path(execution.cwd, cwd);
+      if (execution.kind === "shell") {
+        if (execution.command === undefined) {
+          analyses.push(this.result("ask", [`Dynamic shell execution cannot be resolved statically: ${execution.source}`]));
+        } else analyses.push(...this.analyzeCommandUnits(execution.command, executionCwd).map((unit) => unit.analysis));
+        continue;
       }
+      if (execution.kind === "argv") {
+        if (execution.executable === undefined) {
+          analyses.push(this.result("ask", [`Dynamic process executable cannot be resolved statically: ${execution.source}`]));
+        } else {
+          const dynamicArguments = execution.args === undefined || execution.args.some((argument) => argument === undefined);
+          const category = builtinCommandCategory(commandName(execution.executable));
+          if (dynamicArguments && category !== "allow") {
+            analyses.push(this.result("ask", [`Dynamic process arguments cannot be resolved statically: ${execution.source}`]));
+            analyses.push(this.analyzeCommand(shellQuote([execution.executable]), executionCwd));
+          } else {
+            const argumentsToAnalyze = (execution.args ?? []).map((argument, index) => argument ?? `__bash_guard_dynamic_data_${index}__`);
+            analyses.push(this.analyzeCommand(shellQuote([execution.executable, ...argumentsToAnalyze]), executionCwd));
+          }
+        }
+        continue;
+      }
+      if (execution.path === undefined) {
+        analyses.push(this.result("ask", [`Dynamic module execution cannot be resolved statically: ${execution.source}`]));
+        continue;
+      }
+      const modulePath = this.modulePath(execution.path, executionCwd, execution.language);
+      analyses.push(this.finalize([{ path: modulePath, kind: "execute", source: execution.source, literal: true, existed: pathExists(modulePath) }], [], [], []));
+      if (pathExists(modulePath)) analyses.push(this.screenScript(modulePath, executionCwd, execution.language === "python" ? "python" : "node"));
+    }
+    return combineAnalyses(analyses);
+  }
 
+  private screenSource(source: string, language: ScriptLanguage, cwd: string, label: string, moduleBase = cwd): Analysis {
+    if (Buffer.byteLength(source, "utf8") > 262_144) {
+      return this.result("ask", [`Executable source exceeds the 256 KiB inspection limit: ${label}`]);
+    }
+    const analyses: Analysis[] = [];
+    try {
+      if (language === "javascript") analyses.push(this.sourceScreeningAnalysis(javascriptExecutions(source), cwd, label, moduleBase));
+      else if (language === "python") analyses.push(this.sourceScreeningAnalysis(pythonOperations(source), cwd, label, moduleBase));
+      else if (language === "shell") analyses.push(...this.analyzeCommandUnits(source, cwd).map((unit) => unit.analysis));
+      else {
+        const catastrophic = catastrophicTextReason(source);
+        if (catastrophic) analyses.push(this.result("deny", [`Prohibited script content: ${catastrophic}`]));
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      analyses.push(this.result("ask", [`${label} source analysis failed closed: ${detail}`]));
+    }
+
+    if (language === "other") {
       const references = new Set<string>();
-      for (const match of text.matchAll(/(?:~\/|\/|\.\.?\/)[^\s"'`;,|&()]+/g)) references.add(match[0]);
-      for (const line of text.split("\n")) {
+      for (const match of source.matchAll(/(?:~\/|\/|\.\.?\/)[^\s"'`;,|&()]+/g)) references.add(match[0]);
+      for (const line of source.split("\n")) {
         if (line.trimStart().startsWith("#")) continue;
         try {
           for (const token of shellParse(line) as ParseToken[]) {
             if (typeof token === "string" && !token.startsWith("-")) references.add(token);
           }
-        } catch { /* Non-shell source is covered by explicit path extraction above. */ }
+        } catch { /* Unknown source retains conservative explicit path extraction. */ }
       }
       for (const reference of references) {
         const candidate = this.path(reference, cwd);
         if ((looksLikePath(reference) || pathExists(candidate)) && this.policy.isSecret(candidate)) {
-          return { decision: "deny", reason: `Prohibited script content: secret reference ${candidate}` };
+          analyses.push(this.result("deny", [`Prohibited script content: secret reference ${candidate}`]));
         }
       }
-    } catch { /* Binary or unreadable executable: ownership still controls execution. */ }
-    finally { this.screeningPaths.delete(key); }
-    return undefined;
+    }
+    return combineAnalyses(analyses);
+  }
+
+  private screenScript(path: string, cwd: string, interpreter?: string): Analysis {
+    if (!pathExists(path)) return this.result("allow", []);
+    const key = canonicalPath(path);
+    if (this.screeningPaths.has(key)) return this.result("allow", []);
+    this.screeningPaths.add(key);
+    try {
+      let source: string;
+      try {
+        if (statSync(path).size > 262_144) {
+          return this.result("ask", [`Executable source exceeds the 256 KiB inspection limit: ${path}`]);
+        }
+        source = readFileSync(path, { encoding: "utf8", flag: "r" });
+      } catch {
+        // Binary or unreadable executables remain controlled by execute ownership.
+        return this.result("allow", []);
+      }
+      try {
+        return this.screenSource(source, scriptLanguage(path, interpreter, source), cwd, path, dirname(path));
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        return this.result("ask", [`Executable source analysis failed closed for ${path}: ${detail}`]);
+      }
+    } finally { this.screeningPaths.delete(key); }
   }
 
   private finalize(

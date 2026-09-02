@@ -391,6 +391,7 @@ test("catastrophic screening distinguishes executable commands from fixture data
       'import assert from "node:assert/strict";',
       'import { execSync } from "node:child_process";',
       'const fixture = "git push --force origin main";',
+      'const secretFixture = "\\x2f.env";',
       'execSync(`printf "%s\\n" "${fixture}"`);',
       'assert.equal(fixture.includes("--force"), true);',
     ].join("\n"));
@@ -413,12 +414,20 @@ test("catastrophic screening distinguishes executable commands from fixture data
     assert.equal(f.analyzer.analyzeCommand(`bash ${dataShell}`, f.workspace).decision, "allow");
     assert.equal(f.analyzer.analyzeCommand(`printf '%s\\n' 'git push --force origin main'`, f.workspace).decision, "allow");
     assert.equal(f.analyzer.analyzeCommand(`printf '%s\\n' ':(){ :|:& };:'`, f.workspace).decision, "allow");
+    const inertSecret = "/" + ".env";
+    assert.equal(f.analyzer.analyzeCommand(`printf '%s\\n' '${inertSecret}'`, f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand(`node -e 'console.log("${inertSecret}")'`, f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand(`python -c 'print("${inertSecret}")'`, f.workspace).decision, "allow");
     const inlineData = f.analyzer.analyzeCommand(`node -e 'console.log("git push --force origin main")'`, f.workspace);
-    assert.equal(inlineData.decision, "ask");
-    assert.deepEqual(inlineData.reasons, ["Opaque node inline code requires approval"]);
-    assert.match(
-      f.analyzer.analyzeCommand(`node --test --eval 'console.log("safe")'`, f.workspace).reasons.join(" "),
-      /Opaque node inline code/,
+    assert.equal(inlineData.decision, "allow");
+    assert.deepEqual(inlineData.reasons, []);
+    assert.equal(
+      f.analyzer.analyzeCommand(`python -c 'import os; os.system("git push --force origin main")'`, f.workspace).decision,
+      "deny",
+    );
+    assert.equal(
+      f.analyzer.analyzeCommand(`node --test --eval 'console.log("safe")'`, f.workspace).decision,
+      "allow",
     );
     const unresolvedTests = f.analyzer.analyzeCommand('node --test "$runtime"', f.workspace);
     assert.equal(unresolvedTests.decision, "ask");
@@ -447,6 +456,152 @@ test("catastrophic screening distinguishes executable commands from fixture data
     assert.match(invalid.reasons.join(" "), /could not be inspected safely/);
   } finally { f.cleanup(); }
 });
+test("script and inline source mutations require target ownership", () => {
+  const f = fixture();
+  try {
+    const target = join(f.workspace, "unowned.txt");
+    const owned = join(f.workspace, "owned.txt");
+    const shellScript = join(f.workspace, "mutate.sh");
+    const nodeScript = join(f.workspace, "mutate.mjs");
+    const pythonScript = join(f.workspace, "mutate.py");
+    const executeScript = join(f.workspace, "execute.mjs");
+    const helper = join(f.workspace, "helper.sh");
+    const pythonImportScript = join(f.workspace, "imports.py");
+    const pythonHelper = join(f.workspace, "local_helper.py");
+    const nodeImportScript = join(f.workspace, "imports.mjs");
+    const nodeHelper = join(f.workspace, "local-helper.mjs");
+    writeFileSync(target, "old\n");
+    writeFileSync(owned, "old\n");
+    writeFileSync(shellScript, `printf changed > ${target}\n`);
+    writeFileSync(nodeScript, `import { writeFileSync } from "node:fs";\nwriteFileSync("${target}", "changed");\n`);
+    writeFileSync(pythonScript, `from pathlib import Path\nPath("${target}").write_text("changed")\n`);
+    writeFileSync(helper, "#!/bin/sh\nprintf safe\n");
+    writeFileSync(executeScript, `import { execFileSync } from "node:child_process";\nexecFileSync("${helper}", []);\n`);
+    writeFileSync(pythonHelper, "value = 1\n");
+    writeFileSync(pythonImportScript, "import local_helper\nprint(local_helper.value)\n");
+    writeFileSync(nodeHelper, "export const value = 1;\n");
+    writeFileSync(nodeImportScript, 'import { value } from "./local-helper.mjs";\nconsole.log(value);\n');
+    f.policy.addCreated(owned);
+    f.policy.save("local", {
+      version: 3,
+      ownership: { edit: [], execute: [], full: ["mutate.sh", "mutate.mjs", "mutate.py", "execute.mjs", "imports.py", "imports.mjs"] },
+      secrets: [],
+      commands: { include: [], exclude: [] },
+    });
+
+    for (const command of [`bash ${shellScript}`, `node ${nodeScript}`, `python ${pythonScript}`]) {
+      const result = f.analyzer.analyzeCommand(command, f.workspace);
+      assert.equal(result.decision, "ask", command);
+      assert.deepEqual(result.ownershipCandidates, [{ path: target, required: "edit" }]);
+    }
+    const execution = f.analyzer.analyzeCommand(`node ${executeScript}`, f.workspace);
+    assert.equal(execution.decision, "ask");
+    assert.deepEqual(execution.ownershipCandidates, [{ path: helper, required: "execute" }]);
+    const imported = f.analyzer.analyzeCommand(`python ${pythonImportScript}`, f.workspace);
+    assert.equal(imported.decision, "ask");
+    assert.deepEqual(imported.ownershipCandidates, [{ path: pythonHelper, required: "execute" }]);
+    const nodeImported = f.analyzer.analyzeCommand(`node ${nodeImportScript}`, f.workspace);
+    assert.equal(nodeImported.decision, "ask");
+    assert.deepEqual(nodeImported.ownershipCandidates, [{ path: nodeHelper, required: "execute" }]);
+    assert.equal(
+      f.analyzer.analyzeCommand(`node -e 'require("node:fs").writeFileSync("${owned}", "changed")'`, f.workspace).decision,
+      "allow",
+    );
+    const newNodePath = join(f.workspace, "node-created.txt");
+    const nodeCreation = f.analyzer.analyzeCommand(`node -e 'require("node:fs").writeFileSync("${newNodePath}", "created")'`, f.workspace);
+    assert.equal(nodeCreation.decision, "allow");
+    assert.deepEqual(nodeCreation.creationCandidates, [newNodePath]);
+    assert.equal(
+      f.analyzer.analyzeCommand(`python -c 'open("${owned}", "w").write("changed")'`, f.workspace).decision,
+      "allow",
+    );
+    assert.match(
+      f.analyzer.analyzeCommand(`node -e 'require("node:fs").writeFileSync(runtimePath, "changed")'`, f.workspace).reasons.join(" "),
+      /Dynamic mutative path/,
+    );
+    assert.match(
+      f.analyzer.analyzeCommand(`node -e 'require("node:child_process").execSync(runtimeCommand)'`, f.workspace).reasons.join(" "),
+      /Dynamic shell execution/,
+    );
+    assert.equal(
+      f.analyzer.analyzeCommand(`node -e 'require("node:child_process").spawnSync("printf", [runtimeValue])'`, f.workspace).decision,
+      "allow",
+    );
+    assert.equal(
+      f.analyzer.analyzeCommand(`python -c 'import subprocess; subprocess.run(["printf", runtime_value])'`, f.workspace).decision,
+      "allow",
+    );
+    assert.match(
+      f.analyzer.analyzeCommand(`node -e 'require("node:child_process").spawnSync("rm", [runtimeValue])'`, f.workspace).reasons.join(" "),
+      /Dynamic process arguments/,
+    );
+    assert.match(
+      f.analyzer.analyzeCommand(`python -c 'open(runtime_path, "w")'`, f.workspace).reasons.join(" "),
+      /Dynamic mutative path/,
+    );
+    assert.match(f.analyzer.analyzeCommand(`bash -c 'rm "$RUNTIME"'`, f.workspace).reasons.join(" "), /Dynamic deletion target/);
+    assert.match(f.analyzer.analyzeCommand(`bash -c 'printf value > "$RUNTIME"'`, f.workspace).reasons.join(" "), /Dynamic redirection target/);
+    assert.match(f.analyzer.analyzeCommand(`bash -c 'chmod 600 "$RUNTIME"'`, f.workspace).reasons.join(" "), /dynamic mutation arguments/);
+  } finally { f.cleanup(); }
+});
+
+test("inline heredocs are language-screened and retain shell command order", () => {
+  const f = fixture();
+  try {
+    const target = join(f.workspace, "heredoc-target.txt");
+    writeFileSync(target, "old\n");
+    const safe = f.analyzer.analyzeCommandUnits([
+      `cd ${f.workspace} && node --input-type=module - <<'NODE'`,
+      'import { parse } from "@babel/parser";',
+      'const fixture = "git push --force origin main";',
+      'console.log(parse("const x = 1").type, fixture);',
+      "NODE",
+      "printf done",
+    ].join("\n"), f.root);
+    assert.deepEqual(safe.map((unit) => unit.analysis.decision), ["allow", "allow", "allow"]);
+    assert.equal(safe.some((unit) => /^import\s/.test(unit.command)), false);
+    const inertShellData = f.analyzer.analyzeCommandUnits("cat <<'DATA'\nrm /\nDATA\n", f.workspace);
+    assert.equal(inertShellData.length, 1);
+    assert.equal(inertShellData[0]!.analysis.decision, "allow");
+    const expandedShellData = f.analyzer.analyzeCommandUnits(["cat <<DATA", "$(shutdown now)", "DATA"].join("\n"), f.workspace);
+    assert.equal(expandedShellData[0]!.analysis.decision, "deny");
+
+    const mutative = f.analyzer.analyzeCommandUnits([
+      "python - <<'PY'",
+      "from pathlib import Path",
+      `Path("${target}").write_text("changed")`,
+      "PY",
+    ].join("\n"), f.workspace);
+    assert.equal(mutative.length, 1);
+    assert.equal(mutative[0]!.analysis.decision, "ask");
+    assert.deepEqual(mutative[0]!.analysis.ownershipCandidates, [{ path: target, required: "edit" }]);
+  } finally { f.cleanup(); }
+});
+
+test("informational runtime and package-manager commands are allowed narrowly", () => {
+  const f = fixture();
+  try {
+    const script = join(f.workspace, "check.js");
+    writeFileSync(script, "const value = 1;\n");
+    const fakeNode = join(f.workspace, "node");
+    writeFileSync(fakeNode, "#!/bin/sh\nprintf fake\n");
+    for (const command of [
+      "npm view @lezer/python version --json",
+      "npm ls @lezer/python --depth=0",
+      "npm audit --omit=dev",
+      "node --version",
+      "python --version",
+      "python -m pip list",
+      `node --check ${script}`,
+    ]) assert.equal(f.analyzer.analyzeCommand(command, f.workspace).decision, "allow", command);
+    assert.equal(f.analyzer.analyzeCommand(`${fakeNode} --version`, f.workspace).decision, "ask");
+
+    for (const command of ["npm audit fix", "npm version patch", "python -m pip install package", "python -v"]) {
+      assert.equal(f.analyzer.analyzeCommand(command, f.workspace).decision, "ask", command);
+    }
+  } finally { f.cleanup(); }
+});
+
 
 test("npm test analyzes local lifecycle scripts and nested Node tests", () => {
   const f = fixture();
@@ -490,10 +645,16 @@ test("explicit secret references in a full-owned script are denied", () => {
   try {
     const secret = join(f.workspace, ".env");
     const script = join(f.workspace, "secret-reader.sh");
+    const nodeScript = join(f.workspace, "secret-reader.mjs");
+    const pythonScript = join(f.workspace, "secret_reader.py");
     writeFileSync(secret, "TOKEN=test\n");
     writeFileSync(script, `#!/bin/sh\ncat ${secret}\n`);
-    f.policy.save("local", { version: 3, ownership: { edit: [], execute: [], full: ["secret-reader.sh"] }, secrets: [], commands: { include: [], exclude: [] } });
+    writeFileSync(nodeScript, `import { readFileSync } from "node:fs";\nreadFileSync("${secret}", "utf8");\n`);
+    writeFileSync(pythonScript, `open("${secret}").read()\n`);
+    f.policy.save("local", { version: 3, ownership: { edit: [], execute: [], full: ["secret-reader.sh", "secret-reader.mjs", "secret_reader.py"] }, secrets: [], commands: { include: [], exclude: [] } });
     assert.equal(f.analyzer.analyzeCommand(`bash ${script}`, f.workspace).decision, "deny");
+    assert.equal(f.analyzer.analyzeCommand(`node ${nodeScript}`, f.workspace).decision, "deny");
+    assert.equal(f.analyzer.analyzeCommand(`python ${pythonScript}`, f.workspace).decision, "deny");
   } finally { f.cleanup(); }
 });
 
@@ -775,19 +936,21 @@ test("literal executable variables are analyzed and surfaced per candidate", () 
   } finally { f.cleanup(); }
 });
 
-test("non-shell inline interpreters are opaque rather than parsed as shell", () => {
+test("Node and Python inline source is parsed while other runtimes remain opaque", () => {
   const f = fixture();
   try {
     const grouped = `for p in "${f.workspace}"; do (cd "$p" && node -e 'console.log(\`cwd: \${process.cwd()}\`)'); done`;
     const requiring = f.analyzer.analyzeCommandUnits(grouped, f.workspace)
       .filter((unit) => unit.analysis.decision !== "allow");
-    assert.equal(requiring.length, 1);
-    assert.deepEqual(requiring[0]?.analysis.reasons, ["Opaque node inline code requires approval"]);
+    assert.equal(requiring.length, 0);
 
     assert.equal(f.analyzer.analyzeCommand(`bash -lc "printf safe"`, f.workspace).decision, "allow");
     for (const command of [
       `node --eval 'console.log("safe")'`,
       `python -c 'print("safe")'`,
+    ]) assert.equal(f.analyzer.analyzeCommand(command, f.workspace).decision, "allow", command);
+
+    for (const command of [
       `ruby -e 'puts "safe"'`,
       `perl -e 'print "safe"'`,
       `deno eval 'console.log("safe")'`,
