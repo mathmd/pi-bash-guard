@@ -26,7 +26,7 @@ A local Pi extension that combines shell hazard detection with explicit path own
 - Variables from literal assignments and literal `for … in …` lists are resolved statically, including path-position loop variables. Dynamic values in direct shell/tool input remain unresolved and fail closed where authority is needed; unresolved values discovered only inside approved source are treated as absence of concrete evidence.
 - Unquoted shell globs are expanded against the working directory before path policy checks. Permission details list each concrete match; direct unresolved or over-limit expansions fail closed instead of creating wildcard-shaped ownership entries. Local-source over-limit safeguards also remain fail-closed.
 - Path inference recognizes whole path arguments, not slash-containing code snippets, quoted source text, command strings, URLs, or other embedded text.
-- Headless sessions block anything that would ask.
+- Headless sessions block anything that would ask, unless explicitly opted into session-local YOLO approvals. YOLO auto-allows only `ask`; every `deny` still blocks without prompting.
 - Reads and execution under `/nix/store` bypass ownership prompts; attempted mutation is denied.
 - Standard process I/O endpoints such as `/dev/null`, standard streams, and file descriptors 0–2 bypass ownership checks when used for I/O.
 - Desktop notifications announce permission prompts and when the agent becomes idle.
@@ -73,6 +73,31 @@ Run `/bash-guard`, choose global or local, and the policy opens directly in `$VI
 A flagged operation offers one-time approval, refusal with an optional multiline comment, and **Steer or ask…** while the permission remains pending. Submitted steering is queued as a native Pi steering message, then the same permission menu reopens; the queued message is delivered at the next agent turn after the pending tool outcome. Mutation prompts offer edit/full grants, execution prompts offer execute/full grants, and ambiguous path access offers edit/execute/full. Persistent choices append the exact path and open the policy at that entry. Unknown commands similarly offer an exact argument-aware trust entry, and unknown tools can be added to `tools.read`; both flows open the editor at the inserted line. Neovim receives `+<line>`. Literal standalone unowned deletion may be replaced with `gio trash`.
 
 Menus use `j`/`k` or arrow keys to move, `l` or Enter to accept, and `h` to go back one level. Long command/reason details keep the options visible; use Ctrl-U/Ctrl-D or `g`/`G` to inspect every detail page. Steering and refusal comments use Pi's multiline editor: Enter submits, Shift-Enter/Ctrl-J inserts a newline, and the configured `app.editor.external` binding (Ctrl-G by default) opens the draft in the configured external editor. Esc returns from steering or cancels an optional comment; Esc/Ctrl-C at a permission menu cancels the entire flow. A nonzero permission timeout automatically refuses each unanswered permission menu; opening a text editor pauses that menu instance and returning starts a fresh prompt timeout.
+
+## YOLO approvals for externally sandboxed runs
+
+YOLO is **off by default**. It automates bash-guard's one-time permission decisions across Bash and other guarded tools; it does not disable analysis or create a sandbox.
+
+- `/bash-guard-yolo on` enables it for the current session.
+- `/bash-guard-yolo off` restores normal permission prompting (or fail-closed behavior headlessly).
+- `/bash-guard-yolo status` reports the current mode; bare `/bash-guard-yolo` toggles it.
+- While enabled, a warning-colored **⚠ bash-guard YOLO** marker stays in Pi's footer/status area.
+
+For an unattended launch inside your sandbox, explicitly opt in at startup:
+
+```sh
+pi --bash-guard-yolo -p "Complete the task and run its tests"
+```
+
+Every tool call is still fully analyzed. `ask` receives a one-time allowance without a permission menu, timeout, or attention notification. **All existing hard denials remain**: catastrophes, secret access, unowned permanent deletion, direct `.git` mutations, and system read-only mutations. A denial in any part of a compound call blocks the entire call immediately, even interactively; YOLO never automatically rewrites deletion into trash.
+
+YOLO writes no ownership grants, command/tool trust entries, policy settings, or saved mode state. Normal successful-creation ownership tracking still applies. The mode survives idle and compaction, but resets on `/reload`, `/new`, `/resume`, `/fork`/`/clone`, shutdown, and restart. The CLI flag applies only to the initial startup session, not subsequent resets. Child Pi/subagent processes do not inherit it; each needs its own explicit opt-in.
+
+Use external isolation (for example jail.nix) yourself. YOLO neither detects nor verifies a sandbox, cannot bypass other extensions' restrictions, and does not suppress unrelated Pi dialogs or agent questions. Auto-approving unresolved targets and arbitrary execution carries the same risks as manually choosing **Allow once**.
+
+## Tests
+
+Run `npm test`. Tests use isolated `/tmp/bash-guard-*` fixtures and never execute the hazardous command strings being analyzed. The extension-hook integration test loads a copied extension with Pi's real loader, located via the toolchain paths in `tsconfig.json`; it does not use the live policy. The YOLO fixtures are cleaned with `gio trash`.
 
 ## Limits
 

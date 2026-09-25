@@ -12,6 +12,7 @@ import { strongest } from "./types.ts";
 import { openPolicyManager, promptForDecision, shellBindingDetails } from "./ui.ts";
 import { sendSystemNotification } from "./notifications.ts";
 import { genericPathInputs } from "./tool-paths.ts";
+import { registerYoloMode } from "./yolo-mode.ts";
 
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 interface PendingCreation {
@@ -77,6 +78,7 @@ export default function bashGuard(pi: ExtensionAPI): void {
   let policy: PolicyStore | undefined;
   let analyzer: GuardAnalyzer | undefined;
   const pending = new Map<string, PendingCreation>();
+  const yolo = registerYoloMode(pi);
 
   function configure(cwd: string, trustLocal: boolean): void {
     if (!policy) {
@@ -104,6 +106,12 @@ export default function bashGuard(pi: ExtensionAPI): void {
   pi.on("tool_call", async (event, ctx) => {
     configure(ctx.cwd, ctx.isProjectTrusted());
     const analysis = analyzeTool(event, ctx.cwd, analyzer!, policy!);
+    // Decide only after analyzing the entire call, so a later/nested denial cannot be skipped.
+    const automatic = yolo.automaticDecision(analysis.decision);
+    if (automatic === "deny") {
+      pending.delete(event.toolCallId);
+      return { block: true, reason: `Blocked by bash-guard (YOLO retains hard denials). ${analysis.reasons.join(" ")}` };
+    }
     if (analysis.creationCandidates.length || analysis.creationPatterns?.length) {
       pending.set(event.toolCallId, {
         paths: analysis.creationCandidates.filter((path) => !existsSync(path)),
@@ -111,7 +119,7 @@ export default function bashGuard(pi: ExtensionAPI): void {
         reloadPolicy: analysis.creationCandidates.some((path) => policy!.isPolicyPath(path)),
       });
     }
-    if (analysis.decision === "allow") return;
+    if (analysis.decision === "allow" || automatic === "allow") return;
 
     let promptItems: Array<{ subject: string; analysis: Analysis; unitIndex?: number }>;
     if (isToolCallEventType("bash", event)) {
