@@ -9,6 +9,7 @@ const RUNTIME_INFORMATION_FLAGS = new Map<string, Set<string>>([
   ["node", new Set([...HELP_VERSION_FLAGS, "--v8-options", "--completion-bash"])],
   ["python", new Set(["-h", "--help", "-V", "--version", "--help-env", "--help-xoptions", "--help-all"])],
   ["python3", new Set(["-h", "--help", "-V", "--version", "--help-env", "--help-xoptions", "--help-all"])],
+  ["julia", new Set(HELP_VERSION_FLAGS)],
   ["ruby", new Set(HELP_VERSION_FLAGS)],
   ["perl", new Set(HELP_VERSION_FLAGS)],
   ["lua", new Set(HELP_VERSION_FLAGS)],

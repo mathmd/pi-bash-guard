@@ -567,6 +567,8 @@ test("script and inline source mutations require target ownership", () => {
       `bash -c 'source "$MODULE"'`,
       `bash -c 'git -C "$ROOT" init'`,
       `bash -c 'curl -X POST "$URL"'`,
+      `bash -c 'cat "$ROOT/path"'`,
+      `python -c 'print("$ROOT/path")'`,
       `bash -c 'sudo rm "$TARGET"'`,
     ]) {
       const result = f.analyzer.analyzeCommand(command, f.workspace);
@@ -634,6 +636,129 @@ test("script and inline source mutations require target ownership", () => {
     );
     assert.equal(partiallyConcreteExecution.decision, "ask");
     assert.deepEqual(partiallyConcreteExecution.ownershipCandidates, [{ path: helper, required: "execute" }]);
+  } finally { f.cleanup(); }
+});
+
+test("Julia inline and file source use static evidence without outer path misclassification", () => {
+  const f = fixture();
+  try {
+    const target = join(f.workspace, "julia-target.txt");
+    const secret = join(f.workspace, ".env");
+    const gitDirectory = join(f.workspace, ".git");
+    const gitConfig = join(gitDirectory, "config");
+    const helper = join(f.workspace, "julia-helper.sh");
+    const mainScript = join(f.workspace, "main.jl");
+    const includedScript = join(f.workspace, "included.jl");
+    const dynamicScript = join(f.workspace, "dynamic.jl");
+    const baseline = join(f.workspace, "baseline.sha256");
+    writeFileSync(target, "old\n");
+    writeFileSync(secret, "TOKEN=test\n");
+    mkdirSync(gitDirectory);
+    writeFileSync(gitConfig, "old\n");
+    writeFileSync(helper, "#!/bin/sh\nprintf safe\n");
+    writeFileSync(baseline, "hash path\n");
+    writeFileSync(mainScript, 'include("included.jl")\n');
+    writeFileSync(includedScript, `write("${target}", "changed")\n`);
+    writeFileSync(dynamicScript, 'write(runtime_path, "changed")\n');
+    f.policy.save("local", {
+      version: 3,
+      ownership: { edit: [], execute: [], full: ["main.jl", "included.jl", "dynamic.jl"] },
+      secrets: [],
+      commands: { include: [], exclude: [] },
+    });
+
+    const nodeDiagnostic = f.analyzer.analyzeCommand(
+      `node --input-type=module -e 'import { value } from "./missing-local.mjs"; const source="scripts/output/value"; const command=\`julia -e \${JSON.stringify(source)}\`; console.log(command, value);'`,
+      f.workspace,
+    );
+    assert.equal(nodeDiagnostic.decision, "allow");
+    assert.equal(nodeDiagnostic.reasons.some((reason) => /Dynamic path/.test(reason)), false);
+    assert.deepEqual(nodeDiagnostic.pathExpansions ?? [], []);
+
+    const verificationSource = [
+      "using SHA,TOML",
+      `rec=TOML.parsefile("${join(f.workspace, "verification.toml")}")`,
+      'old=read(`git show HEAD:main.tex`,String)',
+      `new=read("${join(f.workspace, "main.tex")}",String)`,
+      `for line in eachline("${baseline}"); hash,path=split(line;limit=2); open(sha256,path); end`,
+    ].join("; ");
+    const verification = f.analyzer.analyzeCommand(
+      `julia --startup-file=no --project=scripts/threshold_flux -e '${verificationSource}'`,
+      f.workspace,
+    );
+    assert.equal(verification.decision, "allow");
+    assert.equal(verification.reasons.some((reason) => /Dynamic path|Opaque julia|Unknown command julia/.test(reason)), false);
+    assert.deepEqual(verification.pathExpansions ?? [], []);
+    assert.equal(f.analyzer.analyzeCommand(`julia --eval='println("scripts/$runtime/value")'`, f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand(`julia -E'println("safe")'`, f.workspace).decision, "allow");
+    const elevatedInline = f.analyzer.analyzeCommand(`sudo julia -e 'println("scripts/$runtime/value")'`, f.workspace);
+    assert.equal(elevatedInline.decision, "ask");
+    assert.match(elevatedInline.reasons.join(" "), /Elevated execution/);
+    assert.doesNotMatch(elevatedInline.reasons.join(" "), /Dynamic path/);
+
+    const concreteMutation = f.analyzer.analyzeCommand(`julia -e 'write("${target}", "changed")'`, f.workspace);
+    assert.equal(concreteMutation.decision, "ask");
+    assert.deepEqual(concreteMutation.ownershipCandidates, [{ path: target, required: "edit" }]);
+    assert.equal(f.analyzer.analyzeCommand(`julia -e 'rm("${target}")'`, f.workspace).decision, "deny");
+    const partiallyConcreteDelete = f.analyzer.analyzeCommand(`julia -e 'run(Cmd(["rm", "${target}", runtime_argument]))'`, f.workspace);
+    assert.equal(partiallyConcreteDelete.decision, "deny");
+    assert.match(partiallyConcreteDelete.reasons.join(" "), /deletion without edit ownership/i);
+    assert.equal(f.analyzer.analyzeCommand(`julia -e 'write(runtime_path, "changed")'`, f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand(`julia -e 'run(runtime_command)'`, f.workspace).decision, "allow");
+    assert.equal(f.analyzer.analyzeCommand(`julia -e 'read("${secret}", String)'`, f.workspace).decision, "deny");
+    assert.equal(f.analyzer.analyzeCommand(`julia -e 'write("${gitConfig}", "changed")'`, f.workspace).decision, "deny");
+
+    const catastrophic = f.analyzer.analyzeCommand("julia -e 'run(`shutdown now`)'", f.workspace);
+    assert.equal(catastrophic.decision, "deny");
+    assert.match(catastrophic.reasons.join(" "), /system power operation/);
+    const dynamicCwdCatastrophic = f.analyzer.analyzeCommand(`julia -e 'run(Cmd(["shutdown", runtime_argument]; dir=runtime_directory))'`, f.workspace);
+    assert.equal(dynamicCwdCatastrophic.decision, "deny");
+    assert.match(dynamicCwdCatastrophic.reasons.join(" "), /system power operation/);
+    const concreteExecution = f.analyzer.analyzeCommand(`julia -e 'run(\`${helper}\`)'`, f.workspace);
+    assert.equal(concreteExecution.decision, "ask");
+    assert.deepEqual(concreteExecution.ownershipCandidates, [{ path: helper, required: "execute" }]);
+
+    const includedMutation = f.analyzer.analyzeCommand(`julia ${mainScript}`, f.workspace);
+    assert.equal(includedMutation.decision, "ask");
+    assert.deepEqual(includedMutation.ownershipCandidates, [{ path: target, required: "edit" }]);
+    assert.equal(f.analyzer.analyzeCommand(`julia ${dynamicScript}`, f.workspace).decision, "allow");
+    const preloadMutation = f.analyzer.analyzeCommand(`julia -L ${includedScript} -e 'println("safe")'`, f.workspace);
+    assert.equal(preloadMutation.decision, "ask");
+    assert.deepEqual(preloadMutation.ownershipCandidates, [{ path: target, required: "edit" }]);
+
+    const externalPreload = join(f.root, "external-preload.jl");
+    writeFileSync(externalPreload, `write("${target}", "external mutation")\n`);
+    f.policy.save("local", {
+      version: 3,
+      ownership: { edit: [], execute: [], full: ["main.jl", "included.jl", "dynamic.jl", externalPreload] },
+      secrets: [],
+      commands: { include: [], exclude: [] },
+    });
+    const externalPreloadRun = f.analyzer.analyzeCommand(`julia -L ${externalPreload} -e 'println("safe")'`, f.workspace);
+    assert.equal(externalPreloadRun.decision, "ask");
+    assert.deepEqual(externalPreloadRun.ownershipCandidates, [{ path: target, required: "edit" }]);
+
+    const depotDirectory = join(f.workspace, ".julia", "packages", "Fixture", "hash");
+    const depotSource = join(depotDirectory, "Fixture.jl");
+    mkdirSync(depotDirectory, { recursive: true });
+    writeFileSync(depotSource, `write("${target}", "dependency mutation")\n`);
+    f.policy.save("local", {
+      version: 3,
+      ownership: { edit: [], execute: [], full: ["main.jl", "included.jl", "dynamic.jl", ".julia/packages/**"] },
+      secrets: [],
+      commands: { include: [], exclude: [] },
+    });
+    const depotRun = f.analyzer.analyzeCommand(`julia -L ${depotSource} -e 'println("safe")'`, f.workspace);
+    assert.equal(depotRun.decision, "allow");
+    assert.doesNotMatch(depotRun.reasons.join(" "), /julia-target|dependency mutation/);
+
+    const invalid = f.analyzer.analyzeCommand("julia -e 'function broken('", f.workspace);
+    assert.equal(invalid.decision, "ask");
+    assert.match(invalid.reasons.join(" "), /Julia syntax could not be parsed completely/);
+
+    const directDynamic = f.analyzer.analyzeCommand('cat "$RUNTIME/path"', f.workspace);
+    assert.equal(directDynamic.decision, "ask");
+    assert.match(directDynamic.reasons.join(" "), /Dynamic path cannot be resolved statically/);
   } finally { f.cleanup(); }
 });
 test("source screening uses static evidence and stops at external dependency boundaries", () => {
@@ -793,6 +918,14 @@ test("inline heredocs are language-screened and retain shell command order", () 
     assert.equal(mutative.length, 1);
     assert.equal(mutative[0]!.analysis.decision, "ask");
     assert.deepEqual(mutative[0]!.analysis.ownershipCandidates, [{ path: target, required: "edit" }]);
+    const juliaMutative = f.analyzer.analyzeCommandUnits([
+      "julia --startup-file=no - <<'JULIA'",
+      `write("${target}", "changed")`,
+      "JULIA",
+    ].join("\n"), f.workspace);
+    assert.equal(juliaMutative.length, 1);
+    assert.equal(juliaMutative[0]!.analysis.decision, "ask");
+    assert.deepEqual(juliaMutative[0]!.analysis.ownershipCandidates, [{ path: target, required: "edit" }]);
   } finally { f.cleanup(); }
 });
 
@@ -809,6 +942,7 @@ test("informational runtime and package-manager commands are allowed narrowly", 
       "npm audit --omit=dev",
       "node --version",
       "python --version",
+      "julia --version",
       "python -m pip list",
       `node --check ${script}`,
     ]) assert.equal(f.analyzer.analyzeCommand(command, f.workspace).decision, "allow", command);
@@ -865,14 +999,17 @@ test("explicit secret references in a full-owned script are denied", () => {
     const script = join(f.workspace, "secret-reader.sh");
     const nodeScript = join(f.workspace, "secret-reader.mjs");
     const pythonScript = join(f.workspace, "secret_reader.py");
+    const juliaScript = join(f.workspace, "secret_reader.jl");
     writeFileSync(secret, "TOKEN=test\n");
     writeFileSync(script, `#!/bin/sh\ncat ${secret}\n`);
     writeFileSync(nodeScript, `import { readFileSync } from "node:fs";\nreadFileSync("${secret}", "utf8");\n`);
     writeFileSync(pythonScript, `open("${secret}").read()\n`);
-    f.policy.save("local", { version: 3, ownership: { edit: [], execute: [], full: ["secret-reader.sh", "secret-reader.mjs", "secret_reader.py"] }, secrets: [], commands: { include: [], exclude: [] } });
+    writeFileSync(juliaScript, `read("${secret}", String)\n`);
+    f.policy.save("local", { version: 3, ownership: { edit: [], execute: [], full: ["secret-reader.sh", "secret-reader.mjs", "secret_reader.py", "secret_reader.jl"] }, secrets: [], commands: { include: [], exclude: [] } });
     assert.equal(f.analyzer.analyzeCommand(`bash ${script}`, f.workspace).decision, "deny");
     assert.equal(f.analyzer.analyzeCommand(`node ${nodeScript}`, f.workspace).decision, "deny");
     assert.equal(f.analyzer.analyzeCommand(`python ${pythonScript}`, f.workspace).decision, "deny");
+    assert.equal(f.analyzer.analyzeCommand(`julia ${juliaScript}`, f.workspace).decision, "deny");
   } finally { f.cleanup(); }
 });
 
@@ -1043,6 +1180,9 @@ test("quoted Lua source is opaque code rather than a path or unknown command", (
     assert.deepEqual(result.reasons, ["Opaque lua inline code requires approval"]);
     assert.deepEqual(result.accesses, []);
     assert.deepEqual(result.ownershipCandidates, []);
+    const sourceWithDynamicSyntax = f.analyzer.analyzeCommand(`lua -e 'print("$ROOT/path")'`, f.workspace);
+    assert.deepEqual(sourceWithDynamicSyntax.reasons, ["Opaque lua inline code requires approval"]);
+    assert.deepEqual(sourceWithDynamicSyntax.pathExpansions ?? [], []);
     assert.equal(f.analyzer.analyzeCommand("then luac -p .config/hypr/lua/*.lua", f.workspace).decision, "allow");
   } finally { f.cleanup(); }
 });
@@ -1154,7 +1294,7 @@ test("literal executable variables are analyzed and surfaced per candidate", () 
   } finally { f.cleanup(); }
 });
 
-test("Node and Python inline source is parsed while other runtimes remain opaque", () => {
+test("Node, Python, and Julia inline source is parsed while other runtimes remain opaque", () => {
   const f = fixture();
   try {
     const grouped = `for p in "${f.workspace}"; do (cd "$p" && node -e 'console.log(\`cwd: \${process.cwd()}\`)'); done`;

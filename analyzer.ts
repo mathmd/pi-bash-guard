@@ -12,6 +12,7 @@ import { javascriptExecutions } from "./javascript-screening.ts";
 import { selectNodeTestFiles } from "./node-test-selection.ts";
 import { selectNpmScripts } from "./npm-scripts.ts";
 import { pythonOperations } from "./python-screening.ts";
+import { juliaOperations } from "./julia-screening.ts";
 import { displayHeredocOperators, extractShellHeredocs, heredocHasDynamicExpansion, isHeredocMarker, type ShellHeredoc } from "./shell-heredoc.ts";
 import type { SourceScreening } from "./source-operations.ts";
 import type { PolicyStore } from "./policy.ts";
@@ -22,8 +23,9 @@ type GlobToken = { op: "glob"; pattern: string };
 const CONTROL_OPS = new Set(["|", "|&", "&&", "||", ";", "&", "(", ")"]);
 const SOURCE_DYNAMIC_ARGUMENT_PREFIX = "__bash_guard_dynamic_data_";
 const REDIRECT_OPS = new Set([">", ">>", "1>", "1>>", "2>", "2>>", "&>", "&>>", ">&", "<&", "<<<", "<"]);
-const INTERPRETERS = new Set(["bash", "sh", "zsh", "fish", "python", "python3", "node", "ruby", "perl", "lua", "luajit", "deno", "bun"]);
+const INTERPRETERS = new Set(["bash", "sh", "zsh", "fish", "python", "python3", "node", "julia", "ruby", "perl", "lua", "luajit", "deno", "bun"]);
 const SHELL_INTERPRETERS = new Set(["bash", "sh", "zsh", "fish"]);
+type ScriptLanguage = "shell" | "javascript" | "python" | "julia" | "other";
 const GIT_READ_SUBCOMMANDS = new Set([
   "status", "diff", "diff-files", "diff-index", "diff-tree", "log", "show", "rev-parse", "ls-files", "grep",
   "blame", "describe", "shortlog", "for-each-ref", "show-ref", "ls-tree", "cat-file", "name-rev", "rev-list",
@@ -661,48 +663,120 @@ function specialParameterPathBinding(
   };
 }
 
-function hasOpaqueInlineCode(command: string, args: string[]): boolean {
-  const valueFlags: Record<string, Set<string>> = {
-    node: new Set(["-e", "--eval", "-p", "--print"]),
-    python: new Set(["-c"]),
-    python3: new Set(["-c"]),
+interface InlineSourceArgument {
+  argumentIndex: number;
+  source?: string;
+  language: ScriptLanguage;
+  opaque: boolean;
+}
+
+const NODE_OPTION_VALUES = new Set([
+  "--conditions", "--diagnostic-dir", "--experimental-loader", "--input-type", "--import", "--loader",
+  "--redirect-warnings", "--require", "-C", "-r",
+]);
+const PYTHON_OPTION_VALUES = new Set(["-W", "-X"]);
+const JULIA_OPTION_VALUES = new Set([
+  "--bug-report", "--check-bounds", "--code-coverage", "--color", "--compiled-modules", "--cpu-target",
+  "--depwarn", "--gcthreads", "--handle-signals", "--heap-size-hint", "--history-file", "--home",
+  "--image-codegen", "--inline", "--machine-file", "--math-mode", "--optimize", "--output-bc",
+  "--output-code-coverage", "--output-incremental", "--output-ji", "--output-o", "--output-unopt-bc",
+  "--pkgimages", "--procs", "--startup-file", "--sysimage", "--threads", "--track-allocation",
+  "--warn-overwrite", "--warn-scope", "-g", "-H", "-J", "-O", "-p", "-t",
+]);
+
+function optionHasInlineValue(argument: string, options: Set<string>): boolean {
+  return [...options].some((option) => option.startsWith("--") && argument.startsWith(`${option}=`));
+}
+
+function inlineSourceArguments(command: string, args: string[]): InlineSourceArgument[] {
+  const found: InlineSourceArgument[] = [];
+  const separate = (index: number, language: ScriptLanguage, opaque: boolean): number => {
+    found.push({ argumentIndex: index + 1, source: args[index + 1], language, opaque });
+    return index + 1;
+  };
+  const attached = (index: number, source: string, language: ScriptLanguage, opaque: boolean): void => {
+    found.push({ argumentIndex: index, source, language, opaque });
+  };
+
+  if (command === "node") {
+    for (let index = 0; index < args.length; index++) {
+      const argument = args[index]!;
+      if (argument === "--") break;
+      if (["-e", "--eval", "-p", "--print"].includes(argument) || /^-[ep]+$/.test(argument)) { separate(index, "javascript", false); break; }
+      const long = argument.match(/^--(?:eval|print)=(.*)$/s);
+      if (long) { attached(index, long[1]!, "javascript", false); break; }
+      const short = argument.match(/^-[ep](.+)$/s);
+      if (short) { attached(index, short[1]!, "javascript", false); break; }
+      if (NODE_OPTION_VALUES.has(argument)) { index++; continue; }
+      if (optionHasInlineValue(argument, NODE_OPTION_VALUES)) continue;
+      if (!argument.startsWith("-")) break;
+    }
+    return found;
+  }
+
+  if (["python", "python3"].includes(command)) {
+    for (let index = 0; index < args.length; index++) {
+      const argument = args[index]!;
+      if (argument === "--" || argument === "-m" || /^-m.+/.test(argument)) break;
+      if (argument === "-c") { separate(index, "python", false); break; }
+      if (argument.startsWith("-c") && argument.length > 2) { attached(index, argument.slice(2), "python", false); break; }
+      if (PYTHON_OPTION_VALUES.has(argument)) { index++; continue; }
+      if (!argument.startsWith("-")) break;
+    }
+    return found;
+  }
+
+  if (command === "julia") {
+    for (let index = 0; index < args.length; index++) {
+      const argument = args[index]!;
+      if (argument === "--") break;
+      if (["-e", "--eval", "-E", "--print"].includes(argument)) { index = separate(index, "julia", false); continue; }
+      const long = argument.match(/^--(?:eval|print)=(.*)$/s);
+      if (long) { attached(index, long[1]!, "julia", false); continue; }
+      const short = argument.match(/^-[eE](.+)$/s);
+      if (short) { attached(index, short[1]!, "julia", false); continue; }
+      if (["-L", "--load", "-m", "--module"].includes(argument) || JULIA_OPTION_VALUES.has(argument)) { index++; continue; }
+      if (/^-(?:L|m).+/.test(argument) || /^--(?:load|module)=/.test(argument) || optionHasInlineValue(argument, JULIA_OPTION_VALUES)) continue;
+      if (!argument.startsWith("-")) break;
+    }
+    return found;
+  }
+
+  if (SHELL_INTERPRETERS.has(command)) {
+    for (let index = 0; index < args.length; index++) {
+      const argument = args[index]!;
+      if (argument === "--") break;
+      if (argument === "-c" || /^-[^-]*c/.test(argument)) { separate(index, "shell", false); break; }
+      if (["--rcfile", "--init-file", "-O", "+O"].includes(argument)) index++;
+      else if (!argument.startsWith("-") && !argument.startsWith("+")) break;
+    }
+    return found;
+  }
+
+  const opaqueFlags: Record<string, Set<string>> = {
     ruby: new Set(["-e"]),
     perl: new Set(["-e", "-E"]),
     lua: new Set(["-e"]),
     luajit: new Set(["-e"]),
     bun: new Set(["-e", "--eval", "-p", "--print"]),
   };
-  const flags = valueFlags[command];
-  for (const arg of args) {
-    if (arg === "--") return false;
-    if (!arg.startsWith("-")) return (command === "deno" || command === "bun") && arg === "eval";
-    if (flags?.has(arg)) return true;
-    if (flags && [...flags].some((flag) =>
-      flag.startsWith("--") ? arg.startsWith(`${flag}=`) : arg.startsWith(flag) && arg.length > flag.length)) return true;
-  }
-  return false;
-}
-
-interface ExplicitInlineSource { requested: boolean; source?: string; }
-
-function explicitInlineSource(command: string, args: string[]): ExplicitInlineSource {
+  const flags = opaqueFlags[command];
   for (let index = 0; index < args.length; index++) {
     const argument = args[index]!;
-    if (command === "node") {
-      if (["-e", "--eval", "-p", "--print"].includes(argument) || /^-[ep]+$/.test(argument)) {
-        return { requested: true, source: args[index + 1] };
-      }
-      const long = argument.match(/^--(?:eval|print)=(.*)$/s);
-      if (long) return { requested: true, source: long[1] };
-      const short = argument.match(/^-[ep](.+)$/s);
-      if (short) return { requested: true, source: short[1] };
-    } else if (["python", "python3"].includes(command)) {
-      if (argument === "-c") return { requested: true, source: args[index + 1] };
-      if (argument.startsWith("-c") && argument.length > 2) return { requested: true, source: argument.slice(2) };
-    } else return { requested: false };
-    if (argument === "--" || !argument.startsWith("-")) break;
+    if (argument === "--") break;
+    if ((command === "deno" || command === "bun") && argument === "eval") { separate(index, "other", true); break; }
+    if (flags?.has(argument)) { index = separate(index, "other", true); continue; }
+    const long = [...(flags ?? [])].find((flag) => flag.startsWith("--") && argument.startsWith(`${flag}=`));
+    if (long) { attached(index, argument.slice(long.length + 1), "other", true); continue; }
+    const short = [...(flags ?? [])].find((flag) => !flag.startsWith("--") && argument.startsWith(flag) && argument.length > flag.length);
+    if (short) { attached(index, argument.slice(short.length), "other", true); continue; }
+    if (!argument.startsWith("-")) break;
   }
-  return { requested: false };
+  return found;
+}
+
+function hasOpaqueInlineCode(command: string, args: string[]): boolean {
+  return inlineSourceArguments(command, args).some((source) => source.opaque);
 }
 
 function interpreterReadsStdin(command: string, args: string[]): boolean {
@@ -729,6 +803,10 @@ function interpreterReadsStdin(command: string, args: string[]): boolean {
       if (argument === "-") return true;
       if (!argument.startsWith("-")) return false;
     }
+    return true;
+  }
+  if (command === "julia") {
+    if (inlineSourceArguments(command, args).length || juliaModuleArgument(args) || juliaScriptArgument(args)) return false;
     return true;
   }
   if (SHELL_INTERPRETERS.has(command)) {
@@ -775,6 +853,46 @@ function nodePreloads(args: string[]): NodePreload[] {
   return preloads;
 }
 
+interface JuliaPreload { value?: string; source: string; }
+
+function juliaPreloads(args: string[]): JuliaPreload[] {
+  const preloads: JuliaPreload[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const argument = args[index]!;
+    if (argument === "-L" || argument === "--load") {
+      preloads.push({ value: args[++index], source: "julia --load" });
+      continue;
+    }
+    const long = argument.match(/^--load=(.*)$/s);
+    if (long) { preloads.push({ value: long[1], source: "julia --load" }); continue; }
+    const short = argument.match(/^-L(.+)$/s);
+    if (short) preloads.push({ value: short[1], source: "julia --load" });
+  }
+  return preloads;
+}
+
+function juliaModuleArgument(args: string[]): string | undefined {
+  for (let index = 0; index < args.length; index++) {
+    const argument = args[index]!;
+    if (argument === "-m" || argument === "--module") return args[index + 1];
+    const attached = argument.match(/^(?:-m|--module=)(.+)$/s);
+    if (attached) return attached[1];
+  }
+  return undefined;
+}
+
+function juliaScriptArgument(args: string[]): string | undefined {
+  for (let index = 0; index < args.length; index++) {
+    const argument = args[index]!;
+    if (argument === "--") return args[index + 1] === "-" ? undefined : args[index + 1];
+    if (["-e", "--eval", "-E", "--print", "-L", "--load", "-m", "--module"].includes(argument) || JULIA_OPTION_VALUES.has(argument)) { index++; continue; }
+    if (/^-[eELm].+/.test(argument) || /^--(?:eval|print|load|module)=/.test(argument) || optionHasInlineValue(argument, JULIA_OPTION_VALUES)) continue;
+    if (argument === "-") return undefined;
+    if (!argument.startsWith("-")) return argument;
+  }
+  return undefined;
+}
+
 function recursiveCopyTargets(source: string, destination: string, limit = 10_000): string[] {
   const targets: string[] = [];
   const walk = (sourcePath: string, destinationPath: string): void => {
@@ -794,7 +912,6 @@ function recursiveCopyTargets(source: string, destination: string, limit = 10_00
     return [destination];
   }
 }
-type ScriptLanguage = "shell" | "javascript" | "python" | "other";
 type AnalysisContext = "direct" | "source";
 type SourceInspectionRole = "entry" | "module";
 
@@ -802,12 +919,15 @@ function scriptLanguage(path: string, interpreter: string | undefined, source: s
   if (interpreter && SHELL_INTERPRETERS.has(interpreter)) return "shell";
   if (interpreter && ["node", "deno", "bun"].includes(interpreter)) return "javascript";
   if (interpreter && ["python", "python3"].includes(interpreter)) return "python";
+  if (interpreter === "julia") return "julia";
   if (/\.(?:[cm]?[jt]s)$/i.test(path)) return "javascript";
   if (/\.py(?:w)?$/i.test(path)) return "python";
+  if (/\.jl$/i.test(path)) return "julia";
   const shebang = source.split("\n", 1)[0] ?? "";
   if (/^#!.*\b(?:ba|z|fi)?sh\b/.test(shebang)) return "shell";
   if (/^#!.*\b(?:node|deno|bun)\b/.test(shebang)) return "javascript";
   if (/^#!.*\bpython(?:3(?:\.\d+)?)?\b/.test(shebang)) return "python";
+  if (/^#!.*\bjulia\b/.test(shebang)) return "julia";
   return "other";
 }
 
@@ -840,26 +960,34 @@ export class GuardAnalyzer {
     return canonicalPath(resolvePath(raw, cwd, this.policy.home));
   }
 
-  private modulePath(raw: string, base: string, language: "javascript" | "python" = "javascript"): string {
+  private modulePath(raw: string, base: string, language: "javascript" | "python" | "julia" = "javascript"): string {
     let candidate: string;
     try { candidate = raw.startsWith("file:") ? canonicalPath(fileURLToPath(raw)) : this.path(raw, base); }
     catch { return this.path(raw, base); }
     if (pathExists(candidate) && !pathIsDirectory(candidate)) return candidate;
-    const suffixes = language === "python" ? [".py"] : [".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".json"];
+    const suffixes = language === "python" ? [".py"] : language === "julia" ? [".jl"] : [".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".json"];
     for (const suffix of suffixes) {
       if (pathExists(`${candidate}${suffix}`)) return canonicalPath(`${candidate}${suffix}`);
     }
-    const names = language === "python" ? ["__init__.py"] : ["index.js", "index.mjs", "index.cjs", "index.ts", "index.mts", "index.cts", "index.json"];
+    const names = language === "python"
+      ? ["__init__.py"]
+      : language === "julia"
+        ? [`${basename(candidate)}.jl`, join("src", `${basename(candidate)}.jl`)]
+        : ["index.js", "index.mjs", "index.cjs", "index.ts", "index.mts", "index.cts", "index.json"];
     for (const name of names) {
       const nested = join(candidate, name);
       if (pathExists(nested)) return canonicalPath(nested);
+    }
+    if (language === "julia" && /^[A-Za-z_]\w*$/.test(raw)) {
+      const projectModule = join(base, "src", `${raw}.jl`);
+      if (pathExists(projectModule)) return canonicalPath(projectModule);
     }
     return candidate;
   }
   private isInspectableSource(path: string, projectRoot: string, role: SourceInspectionRole): boolean {
     const canonical = canonicalPath(path);
     if (this.policy.isSystemReadonlyPath(canonical)) return false;
-    if (/(?:^|[\\/])node_modules(?:[\\/]|$)/.test(canonical)) return false;
+    if (/(?:^|[\\/])(?:node_modules|\.julia[\\/](?:artifacts|compiled|environments|packages|registries|scratchspaces))[\\/]/.test(canonical)) return false;
     return role === "entry" || isWithin(canonical, canonicalPath(projectRoot));
   }
 
@@ -1179,8 +1307,11 @@ export class GuardAnalyzer {
       if (!executableRaw) continue;
       const cmd = commandName(executableRaw);
       const args = strings.slice(index + 1).filter((arg) => !REDIRECT_OPS.has(arg));
+      const inlineSources = inlineSourceArguments(cmd, args);
+      const inlineSourceIndexes = new Set(inlineSources.map((source) => source.argumentIndex));
+      const invocationArguments = args.filter((_, argumentIndex) => !inlineSourceIndexes.has(argumentIndex));
       const sourceInvocationIncomplete = analysisContext === "source" &&
-        (!isStaticallyResolvedValue(executableRaw) || args.some((arg) => !isStaticallyResolvedValue(arg)));
+        (!isStaticallyResolvedValue(executableRaw) || invocationArguments.some((arg) => !isStaticallyResolvedValue(arg)));
       if (elevated && !sourceInvocationIncomplete) {
         baseDecision = strongest(baseDecision, "ask");
         reasons.push("Elevated execution requires approval");
@@ -1192,8 +1323,8 @@ export class GuardAnalyzer {
           unresolvedEvidence("Unquoted heredoc expansion cannot be resolved statically");
         }
       }
-      for (const arg of args) {
-        if (isStaticallyResolvedValue(arg) || !arg.includes("/") || /^(?:[A-Za-z][A-Za-z0-9+.-]*):\/\//.test(arg) || unresolvedPathArguments.has(arg)) continue;
+      for (const [argumentIndex, arg] of args.entries()) {
+        if (inlineSourceIndexes.has(argumentIndex) || isStaticallyResolvedValue(arg) || !arg.includes("/") || /^(?:[A-Za-z][A-Za-z0-9+.-]*):\/\//.test(arg) || unresolvedPathArguments.has(arg)) continue;
         unresolvedPathArguments.add(arg);
         unresolvedEvidence(`Dynamic path cannot be resolved statically: ${arg}`);
         pathExpansions.push({ expression: arg, matches: [], unresolved: true });
@@ -1525,7 +1656,7 @@ export class GuardAnalyzer {
       }
 
       if (INTERPRETERS.has(cmd)) {
-        const explicit = explicitInlineSource(cmd, args);
+        const supportedInlineSources = inlineSources.filter((source) => !source.opaque);
         if (cmd === "node" && !args.some((argument) => argument === "--test" || argument.startsWith("--test="))) {
           for (const preload of nodePreloads(args)) {
             if (preload.value === undefined || !isStaticallyResolvedValue(preload.value) || /^(?:data|https?):/i.test(preload.value)) {
@@ -1538,11 +1669,21 @@ export class GuardAnalyzer {
             if (pathExists(path)) mergeNested(this.screenScript(path, cwd, "node", sourceRoot, "module"));
           }
         }
-        if (explicit.requested && ["node", "python", "python3"].includes(cmd)) {
-          if (explicit.source === undefined) {
-            unresolvedEvidence(`${cmd} inline source could not be resolved`);
-          } else {
-            mergeNested(this.screenSource(explicit.source, cmd === "node" ? "javascript" : "python", cwd, `inline ${cmd} source`, cwd, sourceRoot));
+        if (cmd === "julia") {
+          for (const preload of juliaPreloads(args)) {
+            if (preload.value === undefined || !isStaticallyResolvedValue(preload.value)) {
+              unresolvedEvidence(`${preload.source} target cannot be resolved safely`);
+              continue;
+            }
+            const path = this.modulePath(preload.value, cwd, "julia");
+            accesses.push({ path, kind: "execute", source: preload.source, literal: true, existed: pathExists(path) });
+            if (pathExists(path)) mergeNested(this.screenScript(path, cwd, "julia", sourceRoot, "entry"));
+          }
+        }
+        if (supportedInlineSources.length) {
+          for (const inline of supportedInlineSources) {
+            if (inline.source === undefined) unresolvedEvidence(`${cmd} inline source could not be resolved`);
+            else mergeNested(this.screenSource(inline.source, inline.language, cwd, `inline ${cmd} source`, cwd, sourceRoot));
           }
           continue;
         }
@@ -1574,20 +1715,9 @@ export class GuardAnalyzer {
             continue;
           }
         }
-        if (SHELL_INTERPRETERS.has(cmd)) {
-          const cIndex = args.findIndex((arg) => arg === "-c" || /^-[^-]*c/.test(arg));
-          if (cIndex >= 0) {
-            const source = args[cIndex + 1];
-            if (source) mergeNested(this.screenSource(source, "shell", cwd, `inline ${cmd} source`, cwd, sourceRoot));
-            else {
-              unresolvedEvidence(`Shell interpreter ${cmd} has an unresolved inline command`);
-            }
-            continue;
-          }
-        }
         if (heredocInputs.length && interpreterReadsStdin(cmd, args)) {
           const heredoc = heredocInputs.at(-1)!;
-          const language: ScriptLanguage = SHELL_INTERPRETERS.has(cmd) ? "shell" : cmd === "node" ? "javascript" : ["python", "python3"].includes(cmd) ? "python" : "other";
+          const language: ScriptLanguage = SHELL_INTERPRETERS.has(cmd) ? "shell" : cmd === "node" ? "javascript" : ["python", "python3"].includes(cmd) ? "python" : cmd === "julia" ? "julia" : "other";
           if (language === "other") {
             baseDecision = strongest(baseDecision, "ask");
             reasons.push(`Opaque ${cmd} heredoc source requires approval`);
@@ -1613,12 +1743,28 @@ export class GuardAnalyzer {
             continue;
           }
         }
+        if (cmd === "julia" && args.some((argument) => argument === "-m" || argument === "--module" || /^-m.+/.test(argument) || argument.startsWith("--module="))) {
+          const module = juliaModuleArgument(args);
+          if (!module || !isStaticallyResolvedValue(module)) {
+            unresolvedEvidence("julia module execution target cannot be resolved statically");
+            continue;
+          }
+          const path = this.modulePath(module.split(".")[0]!, cwd, "julia");
+          if (pathExists(path)) {
+            accesses.push({ path, kind: "execute", source: "julia -m", literal: true, existed: true });
+            mergeNested(this.screenScript(path, cwd, "julia", sourceRoot));
+            continue;
+          }
+          baseDecision = strongest(baseDecision, "ask");
+          reasons.push("julia module execution requires approval");
+          continue;
+        }
         if (hasOpaqueInlineCode(cmd, args)) {
           baseDecision = strongest(baseDecision, "ask");
           reasons.push(`Opaque ${cmd} inline code requires approval`);
           continue;
         }
-        const script = interpreterScriptArgument(cmd, args);
+        const script = cmd === "julia" ? juliaScriptArgument(args) : interpreterScriptArgument(cmd, args);
         if (script) {
           if (!isStaticallyResolvedValue(script)) {
             unresolvedEvidence(`Dynamic ${cmd} script target cannot be resolved statically: ${script}`);
@@ -1875,7 +2021,7 @@ export class GuardAnalyzer {
       if (pathExists(modulePath)) analyses.push(this.screenScript(
         modulePath,
         cwd,
-        execution.language === "python" ? "python" : "node",
+        execution.language === "python" ? "python" : execution.language === "julia" ? "julia" : "node",
         projectRoot,
         "module",
       ));
@@ -1898,6 +2044,11 @@ export class GuardAnalyzer {
     try {
       if (language === "javascript") analyses.push(this.sourceScreeningAnalysis(javascriptExecutions(source), cwd, label, moduleBase, projectRoot));
       else if (language === "python") analyses.push(this.sourceScreeningAnalysis(pythonOperations(source), cwd, label, moduleBase, projectRoot));
+      else if (language === "julia") analyses.push(this.sourceScreeningAnalysis(juliaOperations(source, {
+        cwd,
+        sourceDirectory: moduleBase,
+        ...(pathExists(label) ? { sourceFile: label } : {}),
+      }), cwd, label, moduleBase, projectRoot));
       else if (language === "shell") analyses.push(...this.analyzeCommandUnits(source, cwd, "source", projectRoot).map((unit) => unit.analysis));
       else {
         const catastrophic = catastrophicTextReason(source);
