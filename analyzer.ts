@@ -7,7 +7,7 @@ import type { AccessKind, Analysis, CommandCategory, Decision, PathAccess, PathE
 import { strongest } from "./types.ts";
 import { catastrophicInvocation, catastrophicTextReason, containsUnquotedForkBomb } from "./catastrophic-screening.ts";
 import { informationalInvocation } from "./informational-commands.ts";
-import { canonicalPath, containsGitMetadata, expandHome, isWithin, looksLikePath, pathExists, pathIsDirectory, resolvePath } from "./path-utils.ts";
+import { canonicalPath, containsGitMetadata, isWithin, looksLikePath, pathExists, pathIsDirectory, resolvePath } from "./path-utils.ts";
 import { javascriptExecutions } from "./javascript-screening.ts";
 import { selectNodeTestFiles } from "./node-test-selection.ts";
 import { selectNpmScripts } from "./npm-scripts.ts";
@@ -17,6 +17,11 @@ import { displayHeredocOperators, extractShellHeredocs, heredocHasDynamicExpansi
 import type { SourceScreening } from "./source-operations.ts";
 import type { PolicyStore } from "./policy.ts";
 import { builtinCommandCategory, SHELL_CLOSING_WORDS, SHELL_HEADER_WORDS, SHELL_PREFIX_WORDS } from "./command-catalog.ts";
+import {
+  assignmentEffects, copyShellEnvironment, initialShellEnvironment, invalidateShellEffects, knownShellValue,
+  LOGICAL_DIRECTORY, OPAQUE_VARIABLE_WRITES, READONLY_VARIABLES, mergeShellEnvironments, parseShell,
+  shellDirectoryChange, shellParameterNames, shellValue, UNKNOWN_CWD, type ShellEnvironment,
+} from "./shell-context.ts";
 
 type OpToken = { op: string };
 type GlobToken = { op: "glob"; pattern: string };
@@ -375,7 +380,6 @@ export function splitShellCommandUnits(command: string): string[] {
   return splitShellCommandEntries(command).map((entry) => entry.command);
 }
 
-type ShellEnvironment = Record<string, string>;
 interface GeneratedPathBinding {
   path: string;
   directory: boolean;
@@ -385,45 +389,6 @@ interface GeneratedPathBinding {
 }
 type GeneratedPathEnvironment = Map<string, GeneratedPathBinding>;
 
-function shellEnvironmentResolver(environment: ShellEnvironment, home: string): (key: string) => string {
-  return (key) => environment[key] ?? (key === "HOME" ? home : `$${key}`);
-}
-
-function staticCdDirectory(command: string, cwd: string, home: string, environment: ShellEnvironment): string | undefined {
-  const masked = maskCommandSubstitutions(command);
-  if (masked.sources.length) return undefined;
-  let tokens: ParseToken[];
-  try { tokens = shellParse(masked.command, shellEnvironmentResolver(environment, home)) as ParseToken[]; }
-  catch { return undefined; }
-  if (!tokens.every((token): token is string => typeof token === "string")) return undefined;
-  let index = 0;
-  while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index] ?? "")) index++;
-  if (commandName(tokens[index] ?? "") !== "cd") return undefined;
-  index++;
-  while (["-L", "-P", "-e", "-@"].includes(tokens[index] ?? "")) index++;
-  if (tokens[index] === "--") index++;
-  const target = tokens[index] ?? home;
-  if (target === "-" || tokens[index + 1] !== undefined || !isStaticallyResolvedValue(target)) return undefined;
-  const path = canonicalPath(resolvePath(target, cwd, home));
-  return pathIsDirectory(path) ? path : undefined;
-}
-
-function persistentAssignmentUpdates(command: string, environment: ShellEnvironment, home: string): ShellEnvironment | undefined {
-  let tokens: ParseToken[];
-  try { tokens = shellParse(command, shellEnvironmentResolver(environment, home)) as ParseToken[]; }
-  catch { return undefined; }
-  const words = tokens.filter((token): token is string => typeof token === "string");
-  if (words.length !== tokens.length) return undefined;
-  const assignments = ["export", "readonly", "declare", "typeset"].includes(words[0] ?? "") ? words.slice(1) : words;
-  if (!assignments.length) return undefined;
-  const updates: ShellEnvironment = {};
-  for (const assignment of assignments) {
-    const match = assignment.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s);
-    if (!match) return undefined;
-    updates[match[1]!] = match[2]!;
-  }
-  return updates;
-}
 
 const MAX_GLOB_MATCHES = 512;
 
@@ -434,8 +399,13 @@ interface ShellGlobExpansion {
   truncated: boolean;
 }
 
-function expandShellGlob(pattern: string, cwd: string, home: string): ShellGlobExpansion {
-  const argument = expandHome(pattern, home);
+// Shell parsing already handled active tilde expansion; source string paths are literal too.
+function literalPath(value: string, cwd: string): string {
+  return isAbsolute(value) ? value : `${cwd}/${value}`;
+}
+
+function expandShellGlob(pattern: string, cwd: string): ShellGlobExpansion {
+  const argument = pattern;
   if (!isStaticallyResolvedValue(argument)) return { argument, matches: [], unresolved: true, truncated: false };
   try {
     const allMatches = [...new Set(globSync(argument, { cwd }))].sort();
@@ -452,11 +422,10 @@ function expandShellGlob(pattern: string, cwd: string, home: string): ShellGlobE
 
 interface StaticLoopBinding { name: string; values: string[]; }
 
-function staticLoopBinding(command: string, environment: ShellEnvironment, home: string, cwd: string): StaticLoopBinding | undefined {
-  if (referencedShellVariables(command).some((name) => name !== "HOME")) return undefined;
+function staticLoopBinding(command: string, environment: ShellEnvironment, cwd: string): StaticLoopBinding | undefined {
   let tokens: ParseToken[];
   try {
-    tokens = shellParse(command.replace(/\\\r?\n/g, " "), shellEnvironmentResolver(environment, home)) as ParseToken[];
+    tokens = parseShell(command.replace(/\\\r?\n/g, " "), environment);
   } catch {
     return undefined;
   }
@@ -464,7 +433,7 @@ function staticLoopBinding(command: string, environment: ShellEnvironment, home:
   for (const token of tokens) {
     if (typeof token === "string") words.push(token);
     else if (isGlob(token)) {
-      const expansion = expandShellGlob(token.pattern, cwd, home);
+      const expansion = expandShellGlob(token.pattern, cwd);
       if (expansion.unresolved || expansion.truncated) return undefined;
       words.push(...(expansion.matches.length ? expansion.matches : [expansion.argument]));
     } else return undefined;
@@ -475,34 +444,24 @@ function staticLoopBinding(command: string, environment: ShellEnvironment, home:
   const values = words.slice(start + 3).filter((value) => value !== "do");
   if (!values.length || values.length > 128 || values.some((value) => /[{}]|\$[({A-Za-z_0-9]/.test(value))) return undefined;
   const concreteValues = values.map((value) => {
-    const resolved = resolvePath(value, cwd, home);
+    const resolved = literalPath(value, cwd);
     return looksLikePath(value) || pathExists(resolved) ? canonicalPath(resolved) : value;
   });
   return { name: words[start + 1]!, values: [...new Set(concreteValues)] };
 }
 
 function referencedShellVariables(command: string): string[] {
-  const names = new Set<string>();
-  try {
-    shellParse(command, (name) => {
-      names.add(name);
-      return `$${name}`;
-    });
-  } catch {
-    for (const match of command.matchAll(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g)) {
-      names.add(match[1] ?? match[2]!);
-    }
-  }
-  return [...names];
+  return shellParameterNames(command);
 }
 
 function isStaticallyResolvedValue(value: string): boolean {
-  return !value.startsWith(SOURCE_DYNAMIC_ARGUMENT_PREFIX) && !/\$(?:[$?!#*@0-9-]|\(|\{|[A-Za-z_])|`/.test(value);
+  return knownShellValue(value);
 }
 
 interface MaskedCommandSubstitutions {
   command: string;
   sources: string[];
+  arithmetic: boolean;
 }
 
 function closingParenthesis(source: string, start: number): number | undefined {
@@ -539,6 +498,7 @@ function closingBacktick(source: string, start: number): number | undefined {
 function maskCommandSubstitutions(source: string): MaskedCommandSubstitutions {
   let command = "";
   const sources: string[] = [];
+  let hasArithmetic = false;
   let quote: "'" | '"' | undefined;
   for (let index = 0; index < source.length;) {
     const character = source[index]!;
@@ -559,6 +519,7 @@ function maskCommandSubstitutions(source: string): MaskedCommandSubstitutions {
       if (end === undefined) { command += source.slice(index); break; }
       const arithmetic = source[index + 2] === "(";
       if (arithmetic) {
+        hasArithmetic = true;
         const inner = source.slice(index + 3, Math.max(index + 3, end - 1));
         sources.push(...maskCommandSubstitutions(inner).sources);
       } else sources.push(source.slice(index + 2, end));
@@ -577,19 +538,18 @@ function maskCommandSubstitutions(source: string): MaskedCommandSubstitutions {
     command += character;
     index++;
   }
-  return { command, sources };
+  return { command, sources, arithmetic: hasArithmetic };
 }
 
 function generatedPathAssignment(
   command: string,
   cwd: string,
-  home: string,
   environment: ShellEnvironment,
 ): { name: string; binding: GeneratedPathBinding } | undefined {
   const masked = maskCommandSubstitutions(command);
   if (masked.sources.length !== 1) return undefined;
   let outerTokens: ParseToken[];
-  try { outerTokens = shellParse(masked.command, shellEnvironmentResolver(environment, home)) as ParseToken[]; }
+  try { outerTokens = parseShell(masked.command, environment); }
   catch { return undefined; }
   if (!outerTokens.every((token): token is string => typeof token === "string")) return undefined;
   const assignments = ["export", "readonly", "declare", "typeset"].includes(outerTokens[0] ?? "")
@@ -599,7 +559,7 @@ function generatedPathAssignment(
   if (!assignment) return undefined;
 
   let tokens: ParseToken[];
-  try { tokens = shellParse(masked.sources[0]!, shellEnvironmentResolver(environment, home)) as ParseToken[]; }
+  try { tokens = parseShell(masked.sources[0]!, environment); }
   catch { return undefined; }
   if (!tokens.every((token): token is string => typeof token === "string") || commandName(tokens[0] ?? "") !== "mktemp") return undefined;
   const args = tokens.slice(1);
@@ -621,10 +581,11 @@ function generatedPathAssignment(
     template = arg;
   }
   if (!template) useTmpDir = true;
-  const tmpBase = explicitTmpDir ?? environment.TMPDIR ?? "/tmp";
+  const tmpBase = explicitTmpDir || environment.TMPDIR || "/tmp";
+  if (!knownShellValue(tmpBase) || (template !== undefined && !knownShellValue(template)) || !knownShellValue(suffix)) return undefined;
   const base = explicitTmpDir || useTmpDir
-    ? resolvePath(tmpBase, cwd, home)
-    : template?.includes("/") ? dirname(resolvePath(template, cwd, home)) : cwd;
+    ? literalPath(tmpBase, cwd)
+    : template?.includes("/") ? dirname(literalPath(template, cwd)) : cwd;
   const canonicalBase = canonicalPath(base);
   const name = assignment[1]!;
   const digest = createHash("sha256").update(`${command}\0${cwd}\0${name}`).digest("hex").slice(0, 12);
@@ -648,10 +609,10 @@ function specialParameterPathBinding(
   name: string,
   value: string,
   cwd: string,
-  home: string,
 ): GeneratedPathBinding | undefined {
   if (!value.includes("$$") || /[*?\[]/.test(value) || (!looksLikePath(value) && !value.includes("/"))) return undefined;
-  const resolved = resolvePath(value, cwd, home);
+  if (!knownShellValue(value.replaceAll("$$", "shell-pid"))) return undefined;
+  const resolved = literalPath(value, cwd);
   const digest = createHash("sha256").update(`${name}\0${value}\0${cwd}`).digest("hex").slice(0, 12);
   const marker = `.bash-guard-shell-pid-${digest}`;
   return {
@@ -951,13 +912,18 @@ export class GuardAnalyzer {
   private readonly policy: PolicyStore;
   private readonly screeningPaths = new Set<string>();
   private readonly npmScriptStack = new Set<string>();
+  private shellDepth = 0;
+  private remainingShellUnits = 1024;
 
   constructor(policy: PolicyStore) {
     this.policy = policy;
   }
 
   private path(raw: string, cwd: string): string {
-    return canonicalPath(resolvePath(raw, cwd, this.policy.home));
+    if (cwd === UNKNOWN_CWD && !isAbsolute(raw)) {
+      return `${UNKNOWN_CWD}/${raw.replace(/(^|\/)\.\.(?=\/|$)/g, "$1__parent__")}`;
+    }
+    return canonicalPath(literalPath(raw, cwd));
   }
 
   private modulePath(raw: string, base: string, language: "javascript" | "python" | "julia" = "javascript"): string {
@@ -1015,32 +981,102 @@ export class GuardAnalyzer {
     cwd: string,
     analysisContext: AnalysisContext = "direct",
     sourceRoot = cwd,
+    initialEnvironment: ShellEnvironment = {},
+    initialGeneratedPaths: GeneratedPathEnvironment = new Map(),
+  ): CommandAnalysisUnit[] {
+    if (this.shellDepth === 0) this.remainingShellUnits = 1024;
+    if (this.shellDepth >= 32 || this.remainingShellUnits <= 0) {
+      return [{ command, analysis: this.result("ask", ["Shell context analysis exceeds its nested inspection limit"]) }];
+    }
+    this.shellDepth++;
+    try { return this.analyzeShellUnits(command, cwd, analysisContext, sourceRoot, initialEnvironment, initialGeneratedPaths); }
+    finally { this.shellDepth--; }
+  }
+
+  private analyzeShellUnits(
+    command: string,
+    cwd: string,
+    analysisContext: AnalysisContext,
+    sourceRoot: string,
+    initialEnvironment: ShellEnvironment,
+    initialGeneratedPaths: GeneratedPathEnvironment,
   ): CommandAnalysisUnit[] {
     const extracted = extractShellHeredocs(command);
-    if (extracted.error) {
-      return [{ command, analysis: this.result("ask", [extracted.error]) }];
-    }
+    if (extracted.error) return [{ command, analysis: this.result("ask", [extracted.error]) }];
     command = extracted.command;
-    const environment: ShellEnvironment = {};
-    const candidates = new Map<string, string[]>();
-    const generatedPaths: GeneratedPathEnvironment = new Map();
-    const loops: Array<{ name: string; values: string[]; previous?: string[] }> = [];
+    let environment = initialShellEnvironment(cwd, this.policy.home, initialEnvironment);
+    let candidates = new Map<string, string[]>();
+    let generatedPaths: GeneratedPathEnvironment = new Map([...initialGeneratedPaths].map(([name, binding]) => [name, { ...binding }]));
+    let readonlyNames = new Set(initialEnvironment[READONLY_VARIABLES]);
+    let workingDirectory = cwd === UNKNOWN_CWD ? cwd : canonicalPath(cwd);
+    const loops: Array<{ name: string; values?: string[]; previous?: string[] }> = [];
     const results: CommandAnalysisUnit[] = [];
-    let workingDirectory = cwd;
-    for (const entry of splitShellCommandEntries(command)) {
+    const snapshot = () => ({ environment: copyShellEnvironment(environment), cwd: workingDirectory, candidates: new Map(candidates),
+      generated: new Map([...generatedPaths].map(([name, binding]) => [name, { ...binding }])), readonly: new Set(readonlyNames) });
+    type State = ReturnType<typeof snapshot>;
+    const restore = (state: State) => {
+      environment = copyShellEnvironment(state.environment); workingDirectory = state.cwd; candidates = new Map(state.candidates);
+      generatedPaths = new Map([...state.generated].map(([name, binding]) => [name, { ...binding }])); readonlyNames = new Set(state.readonly);
+    };
+    const merge = (states: State[]) => {
+      const merged = mergeShellEnvironments(states.map((state) => state.environment));
+      workingDirectory = states.every((state) => state.cwd === states[0]!.cwd) ? states[0]!.cwd : UNKNOWN_CWD;
+      candidates = new Map();
+      for (const name of Object.keys(merged)) {
+        const values = [...new Set(states.flatMap((state) => state.candidates.get(name) ?? [shellValue(state.environment, name) ?? `$${name}`]))];
+        if (values.length > 1 && values.length <= 128) candidates.set(name, values);
+      }
+      generatedPaths = new Map([...states[0]!.generated].filter(([name, binding]) => states.every((state) => state.generated.get(name)?.path === binding.path && state.generated.get(name)?.owned === binding.owned)));
+      readonlyNames = new Set(states.flatMap((state) => [...state.readonly]));
+      for (const name of readonlyNames) if (!states.every((state) => state.readonly.has(name))) merged[name] = `$${name}`;
+      environment = merged;
+    };
+    const branches: Array<{ before: State; ends: State[]; hasElse: boolean }> = [];
+    let conditional: State | undefined;
+    let pipeline: State | undefined;
+    let previousSeparator: string | undefined;
+    let groupStart = snapshot();
+    const entries = splitShellCommandEntries(command);
+    for (const entry of entries) {
+      if (results.length >= 1024 || this.remainingShellUnits-- <= 0) {
+        results.push({ command: entry.command, analysis: this.result("ask", ["Shell context analysis exceeds 1024 command units"]) });
+        break;
+      }
       const unit = entry.command;
+      const masked = maskCommandSubstitutions(unit);
       const displayUnit = displayHeredocOperators(unit, extracted.heredocs);
+      if (!previousSeparator || !["&&", "||", "|", "|&"].includes(previousSeparator)) groupStart = snapshot();
+      if (["|", "|&"].includes(entry.separatorAfter ?? "") && !pipeline) pipeline = snapshot();
+      if (pipeline) restore(pipeline);
+      if (/^(?:else|elif)\b/.test(unit.trim()) && branches.length) {
+        const branch = branches.at(-1)!; branch.ends.push(snapshot()); restore(branch.before);
+        branch.hasElse ||= /^else\b/.test(unit.trim());
+      }
+      if (/^if\b/.test(unit.trim())) branches.push({ before: snapshot(), ends: [], hasElse: false });
+      if (/^(?:while|until|case)\b/.test(unit.trim())) {
+        for (const name of Object.keys(environment)) environment[name] = `$${name}`;
+        candidates.clear(); generatedPaths.clear(); workingDirectory = UNKNOWN_CWD;
+      }
+      if (previousSeparator === "||" && conditional) merge([conditional, snapshot()]);
+      if (masked.arithmetic) {
+        for (const name of Object.keys(environment)) if (!readonlyNames.has(name)) environment[name] = `$${name}`;
+        candidates.clear(); generatedPaths.clear();
+      }
+      environment[READONLY_VARIABLES] = new Set(readonlyNames);
       const unitCwd = workingDirectory;
       const resultStart = results.length;
-      const generated = generatedPathAssignment(unit, unitCwd, this.policy.home, environment);
-      const loop = staticLoopBinding(unit, environment, this.policy.home, unitCwd);
-      if (loop) {
+      const generated = environment[OPAQUE_VARIABLE_WRITES] ? undefined : generatedPathAssignment(unit, unitCwd, environment);
+      const generatedWritable = generated && !readonlyNames.has(generated.name);
+      const loop = staticLoopBinding(unit, environment, unitCwd);
+      const loopName = unit.trim().match(/^(?:(?:then|do)\s+)?for\s+([A-Za-z_][A-Za-z0-9_]*)\b/)?.[1];
+      if (loopName) {
         results.push({ command: displayUnit, analysis: this.analyzeCommand(unit, unitCwd, environment, generatedPaths, extracted.heredocs, analysisContext, sourceRoot) });
-        loops.push({ name: loop.name, values: loop.values, previous: candidates.get(loop.name) });
-        candidates.set(loop.name, loop.values);
+        loops.push({ name: loopName, values: loop?.values, previous: candidates.get(loopName) });
+        if (loop) candidates.set(loopName, loop.values);
+        else { candidates.delete(loopName); environment[loopName] = `$${loopName}`; }
+        previousSeparator = entry.separatorAfter;
         continue;
       }
-
       const referencedNames = referencedShellVariables(unit);
       const executableNames = this.executableVariableNames(unit, unitCwd, environment, generatedPaths, extracted.heredocs);
       const expansionNames = [...new Set([...executableNames, ...referencedNames.filter((name) => candidates.has(name))])];
@@ -1049,100 +1085,106 @@ export class GuardAnalyzer {
       ];
       let expansionLimited = false;
       for (const name of expansionNames) {
-        const assigned = environment[name];
-        const values: Array<string | undefined> = candidates.get(name) ??
-          (assigned !== undefined && isStaticallyResolvedValue(assigned)
-            ? [assigned]
-            : name === "HOME" ? [this.policy.home] : [undefined]);
+        const values = (candidates.get(name) ?? [shellValue(environment, name)]).map((value) => knownShellValue(value) ? value : undefined);
         if (contexts.length * values.length > 128) {
           expansionLimited = true;
           const unresolvedEnvironment = { ...environment };
-          for (const variable of expansionNames) delete unresolvedEnvironment[variable];
-          contexts = [{
-            environment: unresolvedEnvironment,
-            bindings: expansionNames.map((variable) => ({ name: variable })),
-          }];
+          for (const variable of expansionNames) unresolvedEnvironment[variable] = `$${variable}`;
+          contexts = [{ environment: unresolvedEnvironment, bindings: expansionNames.map((variable) => ({ name: variable })) }];
           break;
         }
-        contexts = contexts.flatMap((context) => values.map((value) => {
-          const resolvedEnvironment = { ...context.environment };
-          if (value === undefined) delete resolvedEnvironment[name];
-          else resolvedEnvironment[name] = value;
-          return {
-            environment: resolvedEnvironment,
-            bindings: [...context.bindings, { name, ...(value === undefined ? {} : { value }) }],
-          };
-        }));
+        contexts = contexts.flatMap((context) => values.map((value) => ({
+          environment: { ...context.environment, [name]: value ?? `$${name}` },
+          bindings: [...context.bindings, { name, ...(value === undefined ? {} : { value }) }],
+        })));
       }
-
+      const updatesByContext: ShellEnvironment[] = [];
+      const subshell = unit.trim().startsWith("(") && !unit.trim().startsWith("((") && closingParenthesis(unit.trim(), 1) === unit.trim().length - 1;
       for (const context of contexts) {
-        const analysis = this.analyzeCommand(unit, unitCwd, context.environment, generatedPaths, extracted.heredocs, analysisContext, sourceRoot);
+        const analysis = subshell
+          ? combineAnalyses(this.analyzeCommandUnits(unit.trim().slice(1, -1), unitCwd, analysisContext, sourceRoot, context.environment, generatedPaths).map((item) => item.analysis))
+          : this.analyzeCommand(unit, unitCwd, context.environment, generatedPaths, extracted.heredocs, analysisContext, sourceRoot);
         if (generated) {
           const safety = this.finalize([], [generated.binding.path], [], [], generatedPaths);
           analysis.decision = strongest(analysis.decision, safety.decision);
           analysis.reasons.push(...safety.reasons);
           analysis.accesses.push(...safety.accesses);
           analysis.ownershipCandidates.push(...safety.ownershipCandidates);
-          if (generated.binding.discoveryPattern) {
-            analysis.creationPatterns = [...(analysis.creationPatterns ?? []), generated.binding.discoveryPattern];
-          }
+          if (generated.binding.discoveryPattern && !generated.binding.discoveryPattern.startsWith(UNKNOWN_CWD)) analysis.creationPatterns = [...(analysis.creationPatterns ?? []), generated.binding.discoveryPattern];
         }
         if (expansionLimited) {
           analysis.decision = strongest(analysis.decision, "ask");
           analysis.reasons.push("Static variable expansion has more than 128 candidate combinations and cannot be analyzed safely");
         }
         const resolvedBindings = referencedNames.flatMap((name) => {
-          const value = context.environment[name] ?? (name === "HOME" ? this.policy.home : undefined);
+          const value = shellValue(context.environment, name);
           const symbolic = generatedPaths.get(name)?.description;
-          return value !== undefined && isStaticallyResolvedValue(value) ? [{ name, value, ...(symbolic ? { symbolic } : {}) }] : [];
+          return value !== undefined ? [{ name, value, ...(symbolic ? { symbolic } : {}) }] : [];
         });
-        results.push({
-          command: displayUnit,
-          analysis,
-          ...(context.bindings.some(({ name }) => executableNames.includes(name))
-            ? { executableBindings: context.bindings.filter(({ name }) => executableNames.includes(name)) }
-            : {}),
+        results.push({ command: displayUnit, analysis,
+          ...(context.bindings.some(({ name }) => executableNames.includes(name)) ? { executableBindings: context.bindings.filter(({ name }) => executableNames.includes(name)) } : {}),
           ...(resolvedBindings.length ? { resolvedBindings } : {}),
         });
+        const effects = subshell ? undefined : assignmentEffects(masked.command, context.environment, readonlyNames);
+        if (effects) {
+          updatesByContext.push(effects.updates);
+          for (const name of effects.readonly) readonlyNames.add(name);
+        }
       }
       for (const binding of generatedPaths.values()) {
         if (binding.owned) continue;
-        const created = results.slice(resultStart).some(({ analysis }) =>
-          analysis.creationCandidates.some((path) => path === binding.path));
-        if (created) {
+        if (results.slice(resultStart).some(({ analysis }) => analysis.creationCandidates.includes(binding.path))) {
           binding.owned = true;
           binding.directory = /(?:^|\s)mkdir(?:\s|$)|(?:^|\s)git(?:\s+[^;&|]+)?\s+clone(?:\s|$)/.test(unit);
         }
       }
-
-      if (generated) {
-        environment[generated.name] = generated.binding.path;
-        generatedPaths.set(generated.name, generated.binding);
-        candidates.delete(generated.name);
-      }
-      const updates = persistentAssignmentUpdates(unit, environment, this.policy.home);
-      if (updates) {
+      if (updatesByContext.length) {
+        const updates = mergeShellEnvironments(updatesByContext);
         Object.assign(environment, updates);
         for (const [name, value] of Object.entries(updates)) {
+          const values = updatesByContext.map((updates) => updates[name]);
           candidates.delete(name);
-          const special = specialParameterPathBinding(name, value, unitCwd, this.policy.home);
-          if (special) {
-            environment[name] = special.path;
-            generatedPaths.set(name, special);
-          } else generatedPaths.delete(name);
+          if (values.length > 1) candidates.set(name, [...new Set(values.map((value) => knownShellValue(value) ? value : `$${name}`))]);
+          const special = value === undefined ? undefined : specialParameterPathBinding(name, value, unitCwd);
+          if (special) { environment[name] = special.path; generatedPaths.set(name, special); }
+          else generatedPaths.delete(name);
         }
       }
+      if (generated && generatedWritable) {
+        environment[generated.name] = generated.binding.path; generatedPaths.set(generated.name, generated.binding); candidates.delete(generated.name);
+      }
+      if (!subshell) {
+        const invalidated = invalidateShellEffects(masked.command, environment, readonlyNames);
+        for (const name of invalidated) { candidates.delete(name); generatedPaths.delete(name); }
+        if (environment[LOGICAL_DIRECTORY] === UNKNOWN_CWD) workingDirectory = UNKNOWN_CWD;
+        const cd = shellDirectoryChange(masked.command, unitCwd, environment, (path) => pathIsDirectory(path) || [...generatedPaths.values()].some((binding) => binding.directory && binding.path === path));
+        if (cd) {
+          if (!readonlyNames.has("OLDPWD")) environment.OLDPWD = shellValue(environment, "PWD") ?? "$OLDPWD";
+          environment[LOGICAL_DIRECTORY] = contexts.length === 1 ? cd.logical : UNKNOWN_CWD;
+          if (!readonlyNames.has("PWD")) environment.PWD = contexts.length === 1 ? cd.logical : "$PWD";
+          workingDirectory = contexts.length === 1 ? cd.cwd : UNKNOWN_CWD;
+        }
+      }
+      if (/^(?:(?:then|do)\s+)?(?:break|continue)\b/.test(unit.trim()) && loops.length) loops.at(-1)!.values = undefined;
       if (/^done(?:\s|$)/.test(unit.trim())) {
         const closed = loops.pop();
         if (closed) {
-          environment[closed.name] = closed.values.at(-1)!;
-          if (closed.previous) candidates.set(closed.name, closed.previous);
-          else candidates.delete(closed.name);
+          environment[closed.name] = closed.values?.at(-1) ?? `$${closed.name}`;
+          if (closed.previous) candidates.set(closed.name, closed.previous); else candidates.delete(closed.name);
         }
       }
-      if (!["|", "|&", "&"].includes(entry.separatorAfter ?? "")) {
-        workingDirectory = staticCdDirectory(unit, unitCwd, this.policy.home, environment) ?? workingDirectory;
+      if (/^fi\b/.test(unit.trim()) && branches.length) {
+        const branch = branches.pop()!;
+        merge([...branch.ends, snapshot(), ...(!branch.hasElse ? [branch.before] : [])]);
       }
+      if (pipeline && !["|", "|&"].includes(entry.separatorAfter ?? "")) {
+        // Bash lastpipe may run the final builtin in the parent; retain only facts common to both.
+        merge([pipeline, snapshot()]); pipeline = undefined;
+      }
+      if (conditional && !["&&", "||", "|", "|&"].includes(entry.separatorAfter ?? "")) { merge([conditional, snapshot()]); conditional = undefined; }
+      if (!conditional && ["&&", "||"].includes(entry.separatorAfter ?? "")) conditional = snapshot();
+      if (entry.separatorAfter === "&") { restore(groupStart); conditional = undefined; pipeline = undefined; }
+      previousSeparator = entry.separatorAfter;
     }
     return results;
   }
@@ -1150,7 +1192,7 @@ export class GuardAnalyzer {
   analyzePathAccess(path: string, kind: AccessKind, cwd: string, source: string, literal = true): Analysis {
     const lexicalPath = resolvePath(path, cwd, this.policy.home);
     if (["read", "edit"].includes(kind) && this.policy.isSafeProcessIoPath(lexicalPath)) return this.result("allow", []);
-    return this.finalize([{ path: this.path(path, cwd), kind, source, literal }], [], [], []);
+    return this.finalize([{ path: this.path(lexicalPath, cwd), kind, source, literal }], [], [], []);
   }
 
   analyzeCommand(
@@ -1162,6 +1204,7 @@ export class GuardAnalyzer {
     analysisContext: AnalysisContext = "direct",
     sourceRoot = cwd,
   ): Analysis {
+    shellEnvironment = initialShellEnvironment(cwd, this.policy.home, shellEnvironment);
     const substitutions = maskCommandSubstitutions(command);
     if (containsUnquotedForkBomb(substitutions.command)) {
       return this.result("deny", ["Catastrophic operation: fork bomb"]);
@@ -1169,7 +1212,7 @@ export class GuardAnalyzer {
     let tokens: ParseToken[];
     try {
       const normalizedCommand = substitutions.command.replace(/\\\r?\n/g, " ").replace(/\n/g, " ; ");
-      tokens = shellParse(normalizedCommand, shellEnvironmentResolver(shellEnvironment, this.policy.home)) as ParseToken[];
+      tokens = parseShell(normalizedCommand, shellEnvironment);
     }
     catch { return this.result("ask", ["Shell syntax could not be analyzed safely"]); }
 
@@ -1184,6 +1227,7 @@ export class GuardAnalyzer {
       baseDecision = strongest(baseDecision, "ask");
       reasons.push(reason);
     };
+    if (cwd === UNKNOWN_CWD) unresolvedEvidence("Working directory cannot be resolved statically after a shell state change");
     const pathExpansions: PathExpansion[] = [];
     const unmatchedGlobArguments = new Set<string>();
     const unresolvedPathArguments = new Set<string>();
@@ -1200,14 +1244,14 @@ export class GuardAnalyzer {
     };
 
     for (const source of substitutions.sources) {
-      mergeNested(this.analyzeCommand(source, cwd, shellEnvironment, generatedPaths, new Map(), analysisContext, sourceRoot));
+      for (const unit of this.analyzeCommandUnits(source, cwd, analysisContext, sourceRoot, shellEnvironment, generatedPaths)) mergeNested(unit.analysis);
     }
     for (const segment of splitSegments(tokens)) {
       const commandWords: string[] = [];
       for (let i = 0; i < segment.length; i++) {
         const token = segment[i];
         if (isGlob(token)) {
-          const expansion = expandShellGlob(token.pattern, cwd, this.policy.home);
+          const expansion = expandShellGlob(token.pattern, cwd);
           pathExpansions.push({
             expression: token.pattern,
             matches: expansion.matches.map((match) => this.path(match, cwd)),
@@ -1239,7 +1283,7 @@ export class GuardAnalyzer {
               i++;
               continue;
             }
-            const lexicalPath = resolvePath(target, cwd, this.policy.home);
+            const lexicalPath = literalPath(target, cwd);
             if (token.op !== "<<<" && !descriptorTarget && !this.policy.isSafeProcessIoPath(lexicalPath)) {
               const path = this.path(target, cwd);
               if (token.op === "<") accesses.push({ path, kind: "read", source: "redirection", literal: isLiteralShellPath(target) });
@@ -1256,7 +1300,7 @@ export class GuardAnalyzer {
       const strings = commandWords.filter((word) => !(isHeredocMarker(word) && heredocs.has(word)));
       if (!strings.length) continue;
       let index = 0;
-      while (index < strings.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(strings[index])) index++;
+      while (index < strings.length && /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(strings[index])) index++;
       while (SHELL_PREFIX_WORDS.has(commandName(strings[index] ?? ""))) index++;
       let word = commandName(strings[index] ?? "");
       if (SHELL_CLOSING_WORDS.has(word)) continue;
@@ -1324,7 +1368,9 @@ export class GuardAnalyzer {
         }
       }
       for (const [argumentIndex, arg] of args.entries()) {
-        if (inlineSourceIndexes.has(argumentIndex) || isStaticallyResolvedValue(arg) || !arg.includes("/") || /^(?:[A-Za-z][A-Za-z0-9+.-]*):\/\//.test(arg) || unresolvedPathArguments.has(arg)) continue;
+        if (inlineSourceIndexes.has(argumentIndex) || isStaticallyResolvedValue(arg) || /^(?:[A-Za-z][A-Za-z0-9+.-]*):\/\//.test(arg) || unresolvedPathArguments.has(arg)) continue;
+        const expandedOperand = builtinCommandCategory(cmd) !== "allow" && !INTERPRETERS.has(cmd) && referencedShellVariables(command).some((name) => arg.includes(`$${name}`) || arg.includes(`\${${name}`));
+        if (!arg.includes("/") && !expandedOperand && !arg.includes("__bash_guard_substitution_")) continue;
         unresolvedPathArguments.add(arg);
         unresolvedEvidence(`Dynamic path cannot be resolved statically: ${arg}`);
         pathExpansions.push({ expression: arg, matches: [], unresolved: true });
@@ -1478,7 +1524,7 @@ export class GuardAnalyzer {
             unresolvedEvidence(`Dynamic curl output cannot be resolved statically: ${output}`);
             continue;
           }
-          const lexicalOutput = resolvePath(output, cwd, this.policy.home);
+          const lexicalOutput = literalPath(output, cwd);
           if (this.policy.isSafeProcessIoPath(lexicalOutput)) continue;
           const path = this.path(output, cwd);
           if (pathExists(path)) accesses.push({ path, kind: "edit", source: "curl output", literal: true, existed: true });
@@ -1851,7 +1897,7 @@ export class GuardAnalyzer {
       all.findIndex((candidate) => candidate.expression === item.expression &&
         candidate.unresolved === item.unresolved && candidate.truncated === item.truncated &&
         candidate.matches.length === item.matches.length && candidate.matches.every((value, matchIndex) => value === item.matches[matchIndex])) === index);
-    if (creationPatterns.length) finalized.creationPatterns = [...new Set(creationPatterns)];
+    if (creationPatterns.length) finalized.creationPatterns = [...new Set(creationPatterns)].filter((path) => !path.startsWith(UNKNOWN_CWD));
     return finalized;
   }
 
@@ -1882,7 +1928,7 @@ export class GuardAnalyzer {
       if (!isStaticallyResolvedValue(script)) return analysisContext === "source"
         ? this.result("allow", [])
         : this.result("ask", [`Dynamic execution target cannot be resolved statically: ${script}`]);
-      const access = this.analyzePathAccess(script, "execute", cwd, command);
+      const access = this.analyzePathAccess(this.path(script, cwd), "execute", cwd, command);
       const path = this.path(script, cwd);
       return pathExists(path)
         ? combineAnalyses([access, this.screenScript(path, cwd, "bash", sourceRoot, "module")])
@@ -2123,7 +2169,7 @@ export class GuardAnalyzer {
     for (const path of creations) {
       if (this.policy.isPolicyPath(path) || this.policy.isSystemReadonlyPath(path) || containsGitMetadata(path)) {
         accesses.push({ path, kind: "edit", source: "creation", literal: true, existed: false });
-      } else safeCreations.push(path);
+      } else if (!path.startsWith(UNKNOWN_CWD)) safeCreations.push(path);
     }
     let decision: Decision = "allow";
     const ownershipCandidates: Analysis["ownershipCandidates"] = [];
@@ -2150,6 +2196,7 @@ export class GuardAnalyzer {
         reasons.push(`Direct .git modification is prohibited: ${access.path}`);
         continue;
       }
+      if (access.path.startsWith(UNKNOWN_CWD)) continue;
       if (access.literal && ["read", "edit", "execute", "unknown"].includes(access.kind) && !(access.existed ?? pathExists(access.path))) continue;
       const generatedEdit = [...generatedPaths.values()].some((binding) =>
         binding.owned && (access.path === binding.path || (binding.directory && isWithin(access.path, binding.path))));
@@ -2175,9 +2222,9 @@ export class GuardAnalyzer {
     return {
       decision,
       reasons: [...new Set(reasons)],
-      accesses,
+      accesses: accesses.filter((access) => !access.path.startsWith(UNKNOWN_CWD)),
       creationCandidates: [...new Set(safeCreations)],
-      trashablePaths: decision === "deny" ? [...new Set(trashable)] : [],
+      trashablePaths: decision === "deny" ? [...new Set(trashable)].filter((path) => !path.startsWith(UNKNOWN_CWD)) : [],
       ownershipCandidates: ownershipCandidates.filter((item, index, all) => all.findIndex((x) => x.path === item.path && x.required === item.required) === index),
     };
   }

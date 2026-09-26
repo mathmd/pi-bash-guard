@@ -1,20 +1,21 @@
 import { existsSync, globSync, lstatSync, realpathSync, statSync } from "node:fs";
-import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
 
 export function expandHome(value: string, home: string): string {
   if (value === "~") return home;
-  if (value.startsWith(`~${sep}`) || value.startsWith("~/")) return join(home, value.slice(2));
+  if (value.startsWith(`~${sep}`) || value.startsWith("~/")) return `${home}${home.endsWith(sep) ? "" : sep}${value.slice(2)}`;
   return value;
 }
 
 export function resolvePath(value: string, cwd: string, home: string): string {
   const expanded = expandHome(value, home);
-  return normalize(isAbsolute(expanded) ? expanded : resolve(cwd, expanded));
+  // Keep .. until filesystem resolution: link/.. follows the link before traversing its parent.
+  return isAbsolute(expanded) ? expanded : `${cwd}${cwd.endsWith(sep) ? "" : sep}${expanded}`;
 }
 
 /** Resolve symlinks in the existing part while preserving a missing suffix. */
 export function canonicalPath(value: string): string {
-  let cursor = normalize(value);
+  let cursor = value;
   const suffix: string[] = [];
   while (!existsSync(cursor)) {
     const parent = dirname(cursor);

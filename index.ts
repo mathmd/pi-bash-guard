@@ -13,6 +13,7 @@ import { openPolicyManager, promptForDecision, shellBindingDetails } from "./ui.
 import { sendSystemNotification } from "./notifications.ts";
 import { genericPathInputs } from "./tool-paths.ts";
 import { registerYoloMode } from "./yolo-mode.ts";
+import { captureBashContext, verifyBashContext, type BashContextSnapshot } from "./bash-context.ts";
 
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 interface PendingCreation {
@@ -43,9 +44,9 @@ function mergeAnalyses(items: Analysis[]): Analysis {
   }), { decision: "allow", reasons: [], accesses: [], creationCandidates: [], trashablePaths: [], ownershipCandidates: [] });
 }
 
-function analyzeTool(event: ToolCallEvent, cwd: string, analyzer: GuardAnalyzer, policy: PolicyStore): Analysis {
+function analyzeTool(event: ToolCallEvent, cwd: string, analyzer: GuardAnalyzer, policy: PolicyStore, shellContext?: BashContextSnapshot): Analysis {
   if (isToolCallEventType("bash", event)) {
-    return mergeAnalyses(analyzer.analyzeCommandUnits(event.input.command, cwd).map((unit) => unit.analysis));
+    return mergeAnalyses(analyzer.analyzeCommandUnits(event.input.command, shellContext?.cwd ?? cwd, "direct", cwd, shellContext?.environment).map((unit) => unit.analysis));
   }
   if (isToolCallEventType("read", event)) return analyzer.analyzePathAccess(event.input.path, "read", cwd, "read");
   if (isToolCallEventType("write", event)) {
@@ -105,7 +106,13 @@ export default function bashGuard(pi: ExtensionAPI): void {
 
   pi.on("tool_call", async (event, ctx) => {
     configure(ctx.cwd, ctx.isProjectTrusted());
-    const analysis = analyzeTool(event, ctx.cwd, analyzer!, policy!);
+    const shellContext = isToolCallEventType("bash", event) ? captureBashContext(event.input.command, ctx.cwd, policy!.home, process.env) : undefined;
+    const shellUnits = () => isToolCallEventType("bash", event)
+      ? analyzer!.analyzeCommandUnits(event.input.command, shellContext!.cwd, "direct", ctx.cwd, shellContext!.environment) : [];
+    const sealShellContext = () => {
+      if (shellContext && isToolCallEventType("bash", event)) event.input.command = verifyBashContext(event.input.command, shellContext);
+    };
+    const analysis = analyzeTool(event, ctx.cwd, analyzer!, policy!, shellContext);
     // Decide only after analyzing the entire call, so a later/nested denial cannot be skipped.
     const automatic = yolo.automaticDecision(analysis.decision);
     if (automatic === "deny") {
@@ -119,11 +126,11 @@ export default function bashGuard(pi: ExtensionAPI): void {
         reloadPolicy: analysis.creationCandidates.some((path) => policy!.isPolicyPath(path)),
       });
     }
-    if (analysis.decision === "allow" || automatic === "allow") return;
+    if (analysis.decision === "allow" || automatic === "allow") { sealShellContext(); return; }
 
     let promptItems: Array<{ subject: string; analysis: Analysis; unitIndex?: number }>;
     if (isToolCallEventType("bash", event)) {
-      const units = analyzer!.analyzeCommandUnits(event.input.command, ctx.cwd)
+      const units = shellUnits()
         .map((unit, unitIndex) => ({ ...unit, unitIndex }))
         .filter((unit) => unit.analysis.decision !== "allow");
       const combined = units.reduce((decision, unit) => strongest(decision, unit.analysis.decision), "allow" as Analysis["decision"]);
@@ -141,10 +148,10 @@ export default function bashGuard(pi: ExtensionAPI): void {
     for (const item of promptItems) {
       while (true) {
         const refreshedUnit = item.unitIndex !== undefined && isToolCallEventType("bash", event)
-          ? analyzer!.analyzeCommandUnits(event.input.command, ctx.cwd)[item.unitIndex]
+          ? shellUnits()[item.unitIndex]
           : undefined;
         const itemAnalysis = refreshedUnit?.analysis ??
-          (item.unitIndex === undefined ? analyzeTool(event, ctx.cwd, analyzer!, policy!) : item.analysis);
+          (item.unitIndex === undefined ? analyzeTool(event, ctx.cwd, analyzer!, policy!, shellContext) : item.analysis);
         if (itemAnalysis.decision === "allow") break;
         const promptAnalysis = promptItems.length > 1 && itemAnalysis.trashablePaths.length
           ? {
@@ -185,6 +192,7 @@ export default function bashGuard(pi: ExtensionAPI): void {
         };
       }
     }
+    sealShellContext();
     return;
   });
 

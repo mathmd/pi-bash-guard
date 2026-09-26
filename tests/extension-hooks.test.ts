@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { ExtensionCommandContext, LoadExtensionsResult, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
@@ -19,10 +19,12 @@ async function loadFixtureExtension(path: string, cwd: string): Promise<LoadExte
 
 test("complete extension hooks automate YOLO asks, retain denies and creation tracking, and restore normal prompts", async () => {
   const root = mkdtempSync("/tmp/bash-guard-yolo-hooks-");
+  const originalEnvironment = Object.fromEntries(["HOME", "PWD", "XDG_CACHE_HOME", "CDPATH"].map((name) => [name, process.env[name]]));
   try {
     const extensionDir = join(root, "extension");
     const workspace = join(root, "workspace");
     mkdirSync(extensionDir); mkdirSync(workspace);
+    process.env.HOME = workspace; process.env.PWD = workspace; process.env.XDG_CACHE_HOME = workspace; delete process.env.CDPATH;
     for (const name of readdirSync(project)) {
       if (name.endsWith(".ts") || name === "package.json") copyFileSync(join(project, name), join(extensionDir, name));
     }
@@ -90,6 +92,8 @@ test("complete extension hooks automate YOLO asks, retain denies and creation tr
     writeFileSync(metadata, "fixture-metadata");
     for (const input of [
       { command: `rm '${target}'` },
+      { command: 'rm "$XDG_CACHE_HOME/existing.txt"' },
+      { command: 'cat "$XDG_CACHE_HOME/.env"' },
       { command: `unknown-worker --inspect; cat '${secret}'` },
       { command: `cat '${secret}'; unknown-worker --inspect` },
       { command: `printf changed > '${metadata}'` },
@@ -124,6 +128,23 @@ test("complete extension hooks automate YOLO asks, retain denies and creation tr
     assert.equal((await gate("bash", { command: "unknown-worker --inspect" }))?.block, true);
     assert.equal((await gate("write", { path: target, content: "changed" }))?.block, true);
 
+    // Exercise the actual hook's snapshot and command rewrite, not just the helper.
+    const variableRead = { command: 'cat "$XDG_CACHE_HOME/existing.txt"' };
+    assert.equal(await gate("bash", variableRead), undefined);
+    assert.match(variableRead.command, /^# bash-guard: verify analyzed shell context/);
+    const harmless = { command: 'printf "%s" "$XDG_CACHE_HOME"' };
+    assert.equal(await gate("bash", harmless), undefined);
+    const shellEnv = { PATH: process.env.PATH, HOME: workspace, PWD: workspace, XDG_CACHE_HOME: workspace };
+    const matched = spawnSync("bash", ["--noprofile", "--norc", "-c", harmless.command], { cwd: workspace, env: shellEnv, encoding: "utf8" });
+    assert.equal(matched.status, 0, matched.stderr);
+    assert.equal(matched.stdout, workspace);
+    const changed = spawnSync("bash", ["--noprofile", "--norc", "-c", harmless.command], { cwd: workspace, env: { ...shellEnv, XDG_CACHE_HOME: root }, encoding: "utf8" });
+    assert.equal(changed.status, 125);
+    assert.equal(changed.stdout, "");
+    const variableWrite = { command: 'printf changed > "$XDG_CACHE_HOME/existing.txt"' };
+    assert.equal((await gate("bash", variableWrite))?.block, true);
+    assert.equal(variableWrite.command.startsWith("# bash-guard:"), false, "denied calls must remain unchanged");
+
     // RPC uses the normal menu path without requiring a real terminal or desktop notification.
     ctx.hasUI = true; ctx.mode = "rpc";
     assert.equal(await gate("bash", { command: "unknown-worker --inspect" }), undefined);
@@ -144,6 +165,9 @@ test("complete extension hooks automate YOLO asks, retain denies and creation tr
     assert.equal(readFileSync(target, "utf8"), "unchanged");
     assert.equal(existsSync(join(workspace, ".pi", "bash-guard.json")), false);
   } finally {
+    for (const [name, value] of Object.entries(originalEnvironment)) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
     execFileSync("gio", ["trash", "--", root]);
   }
 });

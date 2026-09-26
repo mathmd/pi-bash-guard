@@ -31,6 +31,31 @@ A local Pi extension that combines shell hazard detection with explicit path own
 - Standard process I/O endpoints such as `/dev/null`, standard streams, and file descriptors 0–2 bypass ownership checks when used for I/O.
 - Desktop notifications announce permission prompts and when the agent becomes idle.
 
+## Shell context and inherited paths
+
+Each Bash call starts with a fresh context. The analyzer tracks generic scalar assignments, aliases, supported declarations, append assignments, known-unset versus empty values, and simple non-mutating defaults such as `${root:-$HOME}`. `$PWD` and known `$OLDPWD` follow directory state; logical `cd` and physical `cd -P` are distinct. Saved aliases do not change when the directory changes. Subshells and command substitutions inherit facts without leaking assignments back into the parent.
+
+For example, these paths can be resolved without running the commands during analysis:
+
+```sh
+root="$PWD"
+cache="${XDG_CACHE_HOME:-$HOME/.cache}"
+cd child
+cat "$root/config.json" "$PWD/value.txt" "$cache/report.json"
+```
+
+Inherited lookup is deliberately restricted to reviewed, bounded, absolute single-path values (or explicit empty/unset values): `HOME`, `OLDPWD`, `TMPDIR`, `TMP`, `TEMP`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_RUNTIME_DIR`, `PI_CODING_AGENT_DIR`, and `PI_CODING_AGENT_SESSION_DIR`. Relevant references and implicit dependencies are captured once per call. Initial `PWD` must agree with the effective tool cwd; arbitrary parent `PWD` is not trusted. No XDG defaults are invented. Arbitrary inherited names such as `API_TOKEN`, and path lists such as `PATH`, are not imported or displayed. Rejected inherited values are not copied into diagnostics.
+
+Unknown writes, unsupported variable attributes, unsafe unquoted splitting/globbing, and uncertain directory changes invalidate facts rather than reuse stale values. Conditional alternatives retain concrete evidence, including through aliases. Pipeline/background scope is isolated conservatively, including Bash's optional `lastpipe` behavior. Analysis is bounded to 128 candidate combinations, 1,024 inspected command units, and 32 nested shell inspections. Runtime/random parameters and arbitrary substitution output remain unknown; existing symbolic `mktemp`/PID handling is unchanged in principle. No source or inherited value is executed or evaluated to discover a binding.
+
+### Execution-time verification
+
+Pi's permission hook runs before the eventual command prefix/spawn hook and cannot directly read that final environment. An approved Bash call therefore receives a short verification prefix, executed in the **actual tool shell** after that setup. It checks cwd, captured values, their ordinary scalar attributes, and splitting/search-path assumptions where applicable, without assigning or exporting replacement values. A mismatch prints a generic diagnostic and exits **125 before the submitted body runs**, even under YOLO. Reconcile the startup/prefix/spawn configuration before retrying; merely using literal operands does not remove the cwd/HOME checks.
+
+This retains Pi's execution backend and any external sandbox. It is not a sandbox, a proof about arbitrary startup code, or protection against side effects in setup that runs before the checks. Like any inserted shell prefix, verification can affect ephemeral shell metadata such as line numbers and the previous-command status. Binding facts are not carried into later tool calls or imported into JavaScript/Python/Julia source evaluation.
+
+Resolving a variable does **not** authorize its target or its command. Secret, ownership, `.git`, catastrophic, and system-path checks still apply. In particular, `nix flake metadata --no-write-lock-file "path:$PWD/project"` loses the unresolved-path reason, but still requires managed-state approval; secret-file reads remain denied.
+
 ## Policies
 
 Global policy: `~/.pi/agent/extensions/bash-guard/policy.json`
@@ -97,7 +122,7 @@ Use external isolation (for example jail.nix) yourself. YOLO neither detects nor
 
 ## Tests
 
-Run `npm test`. Tests use isolated `/tmp/bash-guard-*` fixtures and never execute the hazardous command strings being analyzed. The extension-hook integration test loads a copied extension with Pi's real loader, located via the toolchain paths in `tsconfig.json`; it does not use the live policy. The YOLO fixtures are cleaned with `gio trash`.
+Run `npm test`. Tests use isolated `/tmp/bash-guard-*` fixtures and never execute the hazardous command strings being analyzed. The extension-hook integration test loads a copied extension with Pi's real loader, located via the toolchain paths in `tsconfig.json`; it does not use the live policy. Shell-context tests execute only harmless verification probes, checking both matching and changed runtime environments. The YOLO and shell-context fixtures are cleaned with `gio trash`.
 
 ## Limits
 
