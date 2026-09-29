@@ -129,59 +129,34 @@ test("permission details list concrete shell glob matches", () => {
   assert.match(details, /\/tmp\/project\/scripts\/b\.lua/);
 });
 
-test("steering returns to the pending permission and comments use the multiline editor", async () => {
+test("steering hands off without another permission decision and keeps multiline editing", async () => {
   const policy = {
     permissionTimeoutMs: () => 0,
     isPolicyPath: () => false,
   } as unknown as PolicyStore;
   const analysis = {
-    decision: "ask" as const,
-    reasons: ["Approval required"],
-    accesses: [],
-    creationCandidates: [],
-    trashablePaths: [],
-    ownershipCandidates: [],
+    decision: "ask" as const, reasons: ["Approval required"], accesses: [],
+    creationCandidates: [], trashablePaths: [], ownershipCandidates: [],
   };
-  const steering: string[] = [];
-  const steerPrompt = promptHarness(
-    [STEERING_CHOICE, STEERING_CHOICE, "Allow once"],
-    ["  Why is this needed?  ", "Use the read-only alternative if possible."],
-  );
-  const allowed = await promptForDecision(
-    steerPrompt.ctx,
-    policy,
-    analysis,
-    "Pending command",
-    undefined,
-    undefined,
-    (text) => { steering.push(text); },
-  );
-  assert.deepEqual(allowed, { action: "allow" });
-  assert.deepEqual(steering, ["Why is this needed?", "Use the read-only alternative if possible."]);
-  assert.equal(steerPrompt.menus.length, 3, "permission must be shown again after every steering message");
-  assert.ok(steerPrompt.menus.every((choices) => choices.includes("Allow once") && choices.includes("Refuse")));
-  assert.ok(steerPrompt.editorTitles.every((title) => /permission remains pending/.test(title)));
-  assert.equal(steerPrompt.notifications.length, 2);
-  assert.ok(steerPrompt.notifications.every((message) => /permission decision is still pending/.test(message)));
+  for (const decision of ["ask", "deny"] as const) {
+    const prompt = promptHarness([STEERING_CHOICE], ["  Why is this needed?\nCould you avoid changing it?  "]);
+    const result = await promptForDecision(prompt.ctx, policy, { ...analysis, decision }, "Pending command", undefined, undefined, true);
+    assert.deepEqual(result, { action: "steer", context: "Why is this needed?\nCould you avoid changing it?" });
+    assert.equal(prompt.menus.length, 1, "submitting a question must release the permission hook, not reopen its menu");
+    assert.match(prompt.editorTitles[0]!, /defers this operation/);
+    assert.equal(prompt.notifications.length, 0, "only the tool gate dispatches the steering message");
+    assert.equal(prompt.menus[0]!.includes("Allow once"), decision === "ask");
+  }
+
+  for (const input of [undefined, "  \n  "]) {
+    const cancelled = promptHarness([STEERING_CHOICE, "Allow once"], [input]);
+    assert.deepEqual(await promptForDecision(cancelled.ctx, policy, analysis, "Pending command", undefined, undefined, true), { action: "allow" });
+    assert.equal(cancelled.menus.length, 2, "cancelled or empty text returns to the original decision");
+  }
 
   const refusal = promptHarness(["Refuse", "Add comment…"], ["  Stop here.\nUse the safer command.  "]);
   const refused = await promptForDecision(refusal.ctx, policy, analysis, "Pending command");
   assert.deepEqual(refused, { action: "refuse", context: "Stop here.\nUse the safer command." });
   assert.deepEqual(refusal.editorTitles, ["Comment on refusal"]);
-
-  const deniedSteering: string[] = [];
-  const denyPrompt = promptHarness([STEERING_CHOICE, "Refuse", "Refuse without comment"], ["Explain the hard denial."]);
-  const denied = await promptForDecision(
-    denyPrompt.ctx,
-    policy,
-    { ...analysis, decision: "deny" },
-    "Prohibited command",
-    undefined,
-    undefined,
-    (text) => { deniedSteering.push(text); },
-  );
-  assert.deepEqual(denied, { action: "refuse" });
-  assert.deepEqual(deniedSteering, ["Explain the hard denial."]);
-  assert.ok(denyPrompt.menus[0]!.includes(STEERING_CHOICE));
-  assert.ok(denyPrompt.menus[1]!.includes(STEERING_CHOICE));
+  assert.equal(refusal.menus[0]!.includes(STEERING_CHOICE), false);
 });

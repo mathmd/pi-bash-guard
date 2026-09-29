@@ -4,8 +4,9 @@ import type { Analysis, OwnershipLevel } from "./types.ts";
 import type { PolicyScope, PolicyStore } from "./policy.ts";
 import { openPolicyInEditor } from "./external-editor.ts";
 
-export type PromptDecision = { action: "allow" | "refuse" | "trash" | "reevaluate"; context?: string };
-export type SteeringHandler = (text: string) => void | Promise<void>;
+export type PromptDecision =
+  | { action: "allow" | "refuse" | "trash" | "reevaluate"; context?: string }
+  | { action: "steer"; context: string };
 export const STEERING_CHOICE = "Steer or ask…";
 class MenuCancelled extends Error {}
 class PermissionTimedOut extends Error {}
@@ -233,18 +234,12 @@ async function trustCommand(
   return policy.isTrustedCommand(candidate.name, candidate.arguments);
 }
 
-async function addSteering(ctx: ExtensionContext, onSteer: SteeringHandler): Promise<void> {
+async function collectSteering(ctx: ExtensionContext): Promise<PromptDecision | undefined> {
   const text = await ctx.ui.editor(
-    "Steer or ask before deciding (permission remains pending)",
+    "Steer or ask (defers this operation without approving or refusing)",
     "",
   );
-  if (!text?.trim()) return;
-  try {
-    await onSteer(text.trim());
-    ctx.ui.notify("Steering queued; the permission decision is still pending.", "info");
-  } catch (error) {
-    ctx.ui.notify(`Could not queue steering: ${String(error)}`, "warning");
-  }
+  return text?.trim() ? { action: "steer", context: text.trim() } : undefined;
 }
 
 async function refuseWithOptionalComment(ctx: ExtensionContext): Promise<PromptDecision> {
@@ -271,16 +266,17 @@ async function promptFlow(
   subject: string,
   readOnlyTool?: string,
   trustedCommand?: { name: string; arguments: string[] },
-  onSteer?: SteeringHandler,
+  canSteer = false,
 ): Promise<PromptDecision> {
   if (!ctx.hasUI) return { action: "refuse", context: "No interactive UI is available" };
   if (analysis.decision === "deny") {
     while (true) {
       const choices = analysis.trashablePaths.length ? ["Refuse", "Move to trash instead"] : ["Refuse"];
-      if (onSteer) choices.push(STEERING_CHOICE);
+      if (canSteer) choices.push(STEERING_CHOICE);
       const choice = await menu(ctx, summary(analysis, subject), choices, false, policy.permissionTimeoutMs());
-      if (choice === STEERING_CHOICE && onSteer) {
-        await addSteering(ctx, onSteer);
+      if (choice === STEERING_CHOICE && canSteer) {
+        const steering = await collectSteering(ctx);
+        if (steering) return steering;
         continue;
       }
       return choice === "Move to trash instead" ? { action: "trash" } : refuseWithOptionalComment(ctx);
@@ -290,7 +286,7 @@ async function promptFlow(
   const candidate = analysis.ownershipCandidates.find((item) => !policy.isPolicyPath(item.path));
   while (true) {
     const choices = ["Allow once", "Refuse"];
-    if (onSteer) choices.push(STEERING_CHOICE);
+    if (canSteer) choices.push(STEERING_CHOICE);
     const grantLevels = candidate ? ownershipGrantLevels(analysis, candidate) : [];
     for (const level of grantLevels) choices.push(`Grant ${level} ownership…`);
     const trustLabel = readOnlyTool ? `Trust ${readOnlyTool} as read-only…` : undefined;
@@ -298,8 +294,9 @@ async function promptFlow(
     const commandLabel = trustedCommand ? "Trust this command invocation…" : undefined;
     if (commandLabel) choices.push(commandLabel);
     const choice = await menu(ctx, summary(analysis, subject), choices, false, policy.permissionTimeoutMs());
-    if (choice === STEERING_CHOICE && onSteer) {
-      await addSteering(ctx, onSteer);
+    if (choice === STEERING_CHOICE && canSteer) {
+      const steering = await collectSteering(ctx);
+      if (steering) return steering;
       continue;
     }
     if (choice === "Allow once") return { action: "allow" };
@@ -329,10 +326,10 @@ export async function promptForDecision(
   subject: string,
   readOnlyTool?: string,
   trustedCommand?: { name: string; arguments: string[] },
-  onSteer?: SteeringHandler,
+  canSteer = false,
 ): Promise<PromptDecision> {
   try {
-    return await promptFlow(ctx, policy, analysis, subject, readOnlyTool, trustedCommand, onSteer);
+    return await promptFlow(ctx, policy, analysis, subject, readOnlyTool, trustedCommand, canSteer);
   } catch (error) {
     if (error instanceof PermissionTimedOut) return { action: "refuse", context: "Permission prompt timed out" };
     if (error instanceof MenuCancelled) return { action: "refuse" };

@@ -14,6 +14,7 @@ import { sendSystemNotification } from "./notifications.ts";
 import { genericPathInputs } from "./tool-paths.ts";
 import { registerYoloMode } from "./yolo-mode.ts";
 import { captureBashContext, verifyBashContext, type BashContextSnapshot } from "./bash-context.ts";
+import { registerPermissionDiscussion } from "./permission-discussion.ts";
 
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 interface PendingCreation {
@@ -80,6 +81,7 @@ export default function bashGuard(pi: ExtensionAPI): void {
   let analyzer: GuardAnalyzer | undefined;
   const pending = new Map<string, PendingCreation>();
   const yolo = registerYoloMode(pi);
+  const discussion = registerPermissionDiscussion(pi);
 
   function configure(cwd: string, trustLocal: boolean): void {
     if (!policy) {
@@ -113,6 +115,12 @@ export default function bashGuard(pi: ExtensionAPI): void {
       if (shellContext && isToolCallEventType("bash", event)) event.input.command = verifyBashContext(event.input.command, shellContext);
     };
     const analysis = analyzeTool(event, ctx.cwd, analyzer!, policy!, shellContext);
+    const discussionHold = discussion.blockedCall();
+    if (discussionHold) {
+      pending.delete(event.toolCallId);
+      return { ...discussionHold, reason: discussionHold.reason +
+        (analysis.decision === "deny" ? `\nHard denial: ${analysis.reasons.join(" ")}` : "") };
+    }
     // Decide only after analyzing the entire call, so a later/nested denial cannot be skipped.
     const automatic = yolo.automaticDecision(analysis.decision);
     if (automatic === "deny") {
@@ -175,8 +183,12 @@ export default function bashGuard(pi: ExtensionAPI): void {
           item.subject,
           readOnlyTool,
           trustedCommand,
-          (text) => pi.sendUserMessage(text, { deliverAs: "steer" }),
+          true,
         );
+        if (response.action === "steer") {
+          pending.delete(event.toolCallId);
+          return discussion.defer(response.context, ctx, `${item.subject}\nGuard decision: ${itemAnalysis.decision}\n${promptAnalysis.reasons.join("\n")}`);
+        }
         if (response.action === "allow") break;
         if (response.action === "reevaluate") continue;
         if (response.action === "trash" && isToolCallEventType("bash", event) && itemAnalysis.trashablePaths.length && promptItems.length === 1) {
