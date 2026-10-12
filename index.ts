@@ -1,12 +1,11 @@
 import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname } from "node:path";
 import { quote as shellQuote } from "shell-quote";
 import type { ExtensionAPI, ToolCallEvent, ToolResultEvent } from "@earendil-works/pi-coding-agent";
-import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { GuardAnalyzer } from "./analyzer.ts";
 import { canonicalPath, containsGitMetadata, matchingGlobPaths, pathExists, resolvePath } from "./path-utils.ts";
 import { PolicyStore } from "./policy.ts";
+import { globalPolicyDirectory } from "./policy-location.ts";
 import type { Analysis } from "./types.ts";
 import { strongest } from "./types.ts";
 import { openPolicyManager, promptForDecision, shellBindingDetails } from "./ui.ts";
@@ -16,7 +15,6 @@ import { registerYoloMode } from "./yolo-mode.ts";
 import { captureBashContext, verifyBashContext, type BashContextSnapshot } from "./bash-context.ts";
 import { registerPermissionDiscussion } from "./permission-discussion.ts";
 
-const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 interface PendingCreation {
   paths: string[];
   patterns: Array<{ pattern: string; before: Set<string> }>;
@@ -83,31 +81,41 @@ export default function bashGuard(pi: ExtensionAPI): void {
   const yolo = registerYoloMode(pi);
   const discussion = registerPermissionDiscussion(pi);
 
-  function configure(cwd: string, trustLocal: boolean): void {
-    if (!policy) {
-      policy = new PolicyStore(EXTENSION_DIR, cwd);
-      analyzer = new GuardAnalyzer(policy);
+  function configure(cwd: string, trustLocal: boolean): string | undefined {
+    try {
+      if (!policy) {
+        policy = new PolicyStore(globalPolicyDirectory(getAgentDir()), cwd);
+        analyzer = new GuardAnalyzer(policy);
+      }
+      policy.configure(cwd, trustLocal);
+    } catch (error) {
+      return `bash-guard policy initialization failed: ${error instanceof Error ? error.message : String(error)}`;
     }
-    policy.configure(cwd, trustLocal);
   }
 
   pi.registerCommand("bash-guard", {
     description: "Open the global or local bash-guard policy in your editor",
     handler: async (_args, ctx) => {
-      configure(ctx.cwd, ctx.isProjectTrusted());
+      const failure = configure(ctx.cwd, ctx.isProjectTrusted());
+      if (failure) { ctx.ui.notify(failure, "error"); return; }
       await openPolicyManager(ctx, policy!);
     },
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    configure(ctx.cwd, ctx.isProjectTrusted());
+    const failure = configure(ctx.cwd, ctx.isProjectTrusted());
+    if (failure) { ctx.ui.notify(failure, "error"); return; }
     policy!.clearSessionOwnership();
     const issues = policy!.getIssues();
     if (issues.length) ctx.ui.notify(`bash-guard policy issue: ${issues.map((issue) => issue.message).join("; ")}`, "warning");
   });
 
   pi.on("tool_call", async (event, ctx) => {
-    configure(ctx.cwd, ctx.isProjectTrusted());
+    const failure = configure(ctx.cwd, ctx.isProjectTrusted());
+    if (failure) {
+      pending.delete(event.toolCallId);
+      return { block: true, reason: failure };
+    }
     const shellContext = isToolCallEventType("bash", event) ? captureBashContext(event.input.command, ctx.cwd, policy!.home, process.env) : undefined;
     const shellUnits = () => isToolCallEventType("bash", event)
       ? analyzer!.analyzeCommandUnits(event.input.command, shellContext!.cwd, "direct", ctx.cwd, shellContext!.environment) : [];

@@ -1,6 +1,44 @@
 # bash-guard
 
-A local Pi extension that combines shell hazard detection with explicit path ownership.
+A Pi extension that combines shell hazard detection with explicit path ownership, approval dialogs, and static source inspection.
+
+**This is an approval guard, not a sandbox.** Run untrusted code in an OS-level sandbox; see [Limits](#limits).
+
+## Installation
+
+Install [Pi](https://github.com/earendil-works/pi) first, then:
+
+```sh
+pi install git:github.com/mathmd/pi-bash-guard
+```
+
+Restart Pi or run `/reload`. Run `/bash-guard` to open this machine's global or project policy. New installations start without additional ownership or command-trust grants; YOLO remains off.
+
+Requirements: Node.js **22.19.0 or newer**, npm, Git, Bash, and a compatible Pi host (tested with **Pi 1.1.0** on Linux). Pi installs the production dependencies; its own APIs are supplied by the host, not bundled with this extension. Native Tree-sitter parsers use packaged prebuilds where available; other platforms may need Python, make, and a C/C++ compiler for node-gyp. Julia itself is not required for source inspection. Other operating systems have not been validated.
+
+`gio` (GLib) is needed for **Move to trash instead** and the test fixtures. Desktop notifications are best-effort (`notify-send` on Linux); their absence does not disable enforcement. Set `VISUAL` or `EDITOR` for policy editing.
+
+To update or remove the managed package:
+
+```sh
+pi update git:github.com/mathmd/pi-bash-guard
+pi remove git:github.com/mathmd/pi-bash-guard
+```
+
+Reload after updating or removing it. Removal leaves your policy in user state. Install only one copy: do not keep an auto-discovered extension checkout and a managed package active at the same time. A development checkout already loaded by Pi needs no second installation. No npm publication/account is needed; `private: true` prevents accidental npm publication while allowing Git installation.
+
+## Development
+
+```sh
+git clone https://github.com/mathmd/pi-bash-guard.git
+cd pi-bash-guard
+npm ci
+npm run check
+```
+
+`npm run check` runs strict TypeScript checking and the test suite. Tooling and the test Pi host are development dependencies resolved locally; no Nix-store or global-installation paths are required. The lockfile pins the test environment. CI runs on Linux with Node 22 and 24.
+
+For manual testing, load the checkout with `pi -e ./index.ts` from a workspace that has no other bash-guard installation active. Set `PI_CODING_AGENT_DIR` to a separate scratch directory if you want isolated settings and policy. Do not commit live policy, credentials, dependency directories, or operational scratch files. Keep machine-specific permissions private.
 
 ## Decisions
 
@@ -58,9 +96,13 @@ Resolving a variable does **not** authorize its target or its command. Secret, o
 
 ## Policies
 
-Global policy: `~/.pi/agent/extensions/bash-guard/policy.json`
+Global policy: `~/.pi/agent/bash-guard/policy.json`, or `$PI_CODING_AGENT_DIR/bash-guard/policy.json` when Pi's agent directory is overridden. This location is independent of the checkout or package-installation directory.
 
 Project policy: `<project>/.pi/bash-guard.json` (loaded only for trusted projects)
+
+On first use, if the new global policy does not exist, the guard preserves a valid version-3 policy from `<agent-dir>/extensions/bash-guard/policy.json` by copying its exact contents. The old file remains as a backup; subsequent edits use the new location. An existing destination is never overwritten. Invalid/older legacy policies or failures while preserving them stop tool calls, including YOLO calls, until the configuration is repaired. This changes storage location, not policy schema.
+
+Policy files beside arbitrary package checkouts are **not** imported. When moving from a nonstandard installation, copy your reviewed private policy to the new global location yourself. Configure each machine separately, or review absolute paths before copying permissions; do not publish your live policy. `policy.example.json` is a reference, not a file loaded automatically.
 
 ```json
 {
@@ -128,7 +170,9 @@ Use external isolation (for example jail.nix) yourself. YOLO neither detects nor
 
 ## Tests
 
-Run `npm test`. Tests use isolated `/tmp/bash-guard-*` fixtures and never execute the hazardous command strings being analyzed. Extension-hook tests load copied extensions with Pi's real loader, located via the toolchain paths in `tsconfig.json`, without using the live policy. Steering regressions also run Pi's real agent loop in sequential and parallel modes with scripted model responses and harmless tool spies; they verify delivery before another approval, skipped calls, fresh retry checks, and retry-loop prevention without network/model calls. Shell-context tests execute only harmless verification probes. New YOLO, shell-context, and steering fixtures are cleaned with `gio trash`.
+Run `npm test`. Tests use isolated `/tmp/bash-guard-*` fixtures and never execute the hazardous command strings being analyzed. Extension-hook tests load copied extensions with the development Pi dependency's real loader with isolated `PI_CODING_AGENT_DIR` values, without using the live policy. Steering regressions also run Pi's real agent loop in sequential and parallel modes with scripted model responses and harmless tool spies; they verify delivery before another approval, skipped calls, fresh retry checks, and retry-loop prevention without network/model calls. Shell-context tests execute only harmless verification probes. New YOLO, shell-context, and steering fixtures are cleaned with `gio trash`.
+
+Policy-location regressions cover exact legacy preservation, destination precedence, symlinks, rejected invalid/older policies, filesystem failures, checkout-independent configuration, and fail-closed initialization under YOLO. Their scratch fixtures are also trashed.
 
 ## Limits
 

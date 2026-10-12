@@ -7,3 +7,8 @@ progress.log
 policy.json
 *.tmp-*
 .DS_Store
+/.pi/
+auth.json
+.env
+.env.*
+*.tgz

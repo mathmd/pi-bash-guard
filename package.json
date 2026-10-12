@@ -1,17 +1,42 @@
 {
-  "name": "local-pi-bash-guard",
+  "name": "pi-bash-guard",
+  "version": "0.1.0",
+  "description": "Path-aware shell and tool permissions for Pi, with static source inspection and explicit approval controls.",
   "private": true,
   "type": "module",
+  "license": "MIT",
+  "author": "mathmd",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mathmd/pi-bash-guard.git"
+  },
+  "homepage": "https://github.com/mathmd/pi-bash-guard#readme",
+  "bugs": "https://github.com/mathmd/pi-bash-guard/issues",
+  "keywords": ["pi-package", "pi-extension", "permissions", "bash"],
+  "engines": { "node": ">=22.19.0" },
+  "files": ["*.ts", "policy.example.json", "README.md", "LICENSE"],
   "dependencies": {
     "@babel/parser": "^7.29.8",
     "@lezer/common": "^1.5.2",
     "@lezer/python": "^1.1.19",
-    "shell-quote": "^1.8.3",
+    "shell-quote": "^1.12.0",
     "tree-sitter": "0.21.1",
     "tree-sitter-julia": "0.23.1"
   },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-tui": "1.1.0",
+    "@types/node": "^24.0.0",
+    "typescript": "~5.9.3"
+  },
   "scripts": {
-    "test": "node --test tests/*.test.ts"
+    "typecheck": "tsc --project tsconfig.json",
+    "test": "node --test tests/*.test.ts",
+    "check": "npm run typecheck && npm test"
   },
   "pi": {
     "extensions": ["./index.ts"]

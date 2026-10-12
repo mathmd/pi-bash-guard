@@ -54,7 +54,7 @@ export function parsePermissionTimeout(value: 0 | string | undefined): number {
   return timeoutMs;
 }
 
-function validatePolicy(value: unknown): PolicyFile {
+export function validatePolicy(value: unknown): PolicyFile {
   if (!value || typeof value !== "object") throw new Error("policy must be an object");
   const obj = value as Record<string, unknown>;
   if (obj.version !== 3) throw new Error("version must be 3; edit this policy manually (automatic migration is disabled)");
@@ -165,7 +165,7 @@ export class PolicyStore {
   private gitTrackedPaths = new Set<string>();
 
   constructor(
-    extensionDir: string,
+    policyDir: string,
     cwd: string,
     home = homedir(),
     systemReadonlyRoots = ["/nix/store"],
@@ -177,7 +177,7 @@ export class PolicyStore {
       deviceRoot: normalize(processIoRoots.deviceRoot),
       processFdRoot: normalize(processIoRoots.processFdRoot),
     };
-    this.globalPath = join(extensionDir, "policy.json");
+    this.globalPath = join(policyDir, "policy.json");
     this.cwd = canonicalPath(cwd);
     this.localPath = join(this.cwd, ".pi", "bash-guard.json");
     this.reload(true);

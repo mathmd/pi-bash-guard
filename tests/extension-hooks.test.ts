@@ -2,24 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
-import { dirname, join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import type { ExtensionCommandContext, LoadExtensionsResult, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
-
-const project = dirname(dirname(fileURLToPath(import.meta.url)));
-
-async function loadFixtureExtension(path: string, cwd: string): Promise<LoadExtensionsResult> {
-  // Use the same installed Pi version as our TypeScript config, including its real jiti aliases.
-  // Native Node cannot resolve Pi's injected runtime imports on its own.
-  const config = JSON.parse(readFileSync(join(project, "tsconfig.json"), "utf8"));
-  const piDist = dirname(config.compilerOptions.paths["@earendil-works/pi-coding-agent"][0]);
-  const { loadExtensions } = await import(pathToFileURL(join(piDist, "core", "extensions", "loader.js")).href);
-  return loadExtensions([path], cwd);
-}
+import { join } from "node:path";
+import type { ExtensionCommandContext, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
+import { loadFixtureExtension, project } from "./pi-runtime.ts";
 
 test("complete extension hooks automate YOLO asks, retain denies and creation tracking, and restore normal prompts", async () => {
   const root = mkdtempSync("/tmp/bash-guard-yolo-hooks-");
-  const originalEnvironment = Object.fromEntries(["HOME", "PWD", "XDG_CACHE_HOME", "CDPATH"].map((name) => [name, process.env[name]]));
+  const originalEnvironment = Object.fromEntries(["HOME", "PWD", "XDG_CACHE_HOME", "CDPATH", "PI_CODING_AGENT_DIR"].map((name) => [name, process.env[name]]));
   try {
     const extensionDir = join(root, "extension");
     const workspace = join(root, "workspace");
@@ -29,7 +18,10 @@ test("complete extension hooks automate YOLO asks, retain denies and creation tr
       if (name.endsWith(".ts") || name === "package.json") copyFileSync(join(project, name), join(extensionDir, name));
     }
     symlinkSync(join(project, "node_modules"), join(extensionDir, "node_modules"), "dir");
-    const policyPath = join(extensionDir, "policy.json");
+    process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+    const policyDir = join(process.env.PI_CODING_AGENT_DIR, "bash-guard");
+    mkdirSync(policyDir, { recursive: true });
+    const policyPath = join(policyDir, "policy.json");
     const policyText = JSON.stringify({
       version: 3, ownership: { edit: [], execute: [], full: [] }, secrets: [],
       commands: { include: [], exclude: [] }, permissionTimeout: "1s",

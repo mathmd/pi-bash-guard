@@ -2,10 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import type { ExtensionCommandContext, LoadExtensionsResult, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
+import { pathToFileURL } from "node:url";
+import type { ExtensionCommandContext, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
+import { loadFixtureExtension, piRequire, project } from "./pi-runtime.ts";
 import { STEERING_CHOICE } from "../ui.ts";
 
 type ToolCall = { type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> };
@@ -16,8 +16,9 @@ const toolCall = (id: string, name: string, args: Record<string, unknown>): Tool
 for (const toolExecution of ["parallel", "sequential"]) {
   test(`permission steering reaches the next real agent turn without another approval (${toolExecution})`, { timeout: 15_000 }, async () => {
     const root = mkdtempSync("/tmp/bash-guard-steering-hooks-");
+    const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
     try {
-      const project = dirname(dirname(fileURLToPath(import.meta.url)));
+      process.env.PI_CODING_AGENT_DIR = join(root, "agent");
       const extensionDir = join(root, "extension");
       const workspace = join(root, "workspace");
       mkdirSync(extensionDir); mkdirSync(workspace);
@@ -25,7 +26,9 @@ for (const toolExecution of ["parallel", "sequential"]) {
         if (name.endsWith(".ts") || name === "package.json") copyFileSync(join(project, name), join(extensionDir, name));
       }
       symlinkSync(join(project, "node_modules"), join(extensionDir, "node_modules"), "dir");
-      const policyPath = join(extensionDir, "policy.json");
+      const policyDir = join(process.env.PI_CODING_AGENT_DIR, "bash-guard");
+      mkdirSync(policyDir, { recursive: true });
+      const policyPath = join(policyDir, "policy.json");
       const policyText = JSON.stringify({
         version: 3, ownership: { edit: [], execute: [], full: [] }, secrets: [],
         commands: { include: [], exclude: [] }, permissionTimeout: 0,
@@ -35,15 +38,11 @@ for (const toolExecution of ["parallel", "sequential"]) {
       const created = join(workspace, "deferred-output.txt");
       writeFileSync(target, "unchanged");
 
-      // Use the actual installed loader AND agent loop; only provider responses and tool bodies are mocked.
-      const config = JSON.parse(readFileSync(join(project, "tsconfig.json"), "utf8"));
-      const piDist = dirname(config.compilerOptions.paths["@earendil-works/pi-coding-agent"][0]);
-      const require = createRequire(join(piDist, "index.js"));
-      const { loadExtensions } = await import(pathToFileURL(join(piDist, "core/extensions/loader.js")).href);
-      const coreDir = dirname(require.resolve("@earendil-works/pi-agent-core/package.json"));
+      // Use the actual development Pi loader AND agent loop; only provider responses and tool bodies are mocked.
+      const coreDir = dirname(piRequire.resolve("@earendil-works/pi-agent-core/package.json"));
       const { runAgentLoop } = await import(pathToFileURL(join(coreDir, "dist/agent-loop.js")).href);
-      const { Type } = await import(pathToFileURL(require.resolve("typebox")).href);
-      const loaded: LoadExtensionsResult = await loadExtensions([join(extensionDir, "index.ts")], workspace);
+      const { Type } = await import(pathToFileURL(piRequire.resolve("typebox")).href);
+      const loaded = await loadFixtureExtension(join(extensionDir, "index.ts"), workspace);
       assert.deepEqual(loaded.errors, []);
       const extension = loaded.extensions[0]!;
       const statuses = new Map<string, string | undefined>();
@@ -206,6 +205,10 @@ for (const toolExecution of ["parallel", "sequential"]) {
       assert.equal(readFileSync(target, "utf8"), "unchanged");
       assert.equal(readFileSync(policyPath, "utf8"), policyText);
       assert.equal(existsSync(join(workspace, ".pi", "bash-guard.json")), false);
-    } finally { execFileSync("gio", ["trash", "--", root]); }
+    } finally {
+      if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+      execFileSync("gio", ["trash", "--", root]);
+    }
   });
 }

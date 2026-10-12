@@ -8,18 +8,7 @@
     "skipLibCheck": true,
     "allowImportingTsExtensions": true,
     "noUncheckedIndexedAccess": false,
-    "typeRoots": [
-      "/nix/store/xbg0n9ilm7w96gczk2qwqmm5baizhj2x-pi-coding-agent-0.84.2/lib/node_modules/@types"
-    ],
-    "baseUrl": ".",
-    "paths": {
-      "@earendil-works/pi-coding-agent": [
-        "/nix/store/xbg0n9ilm7w96gczk2qwqmm5baizhj2x-pi-coding-agent-0.84.2/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"
-      ],
-      "@earendil-works/pi-tui": [
-        "/nix/store/xbg0n9ilm7w96gczk2qwqmm5baizhj2x-pi-coding-agent-0.84.2/lib/node_modules/@earendil-works/pi-tui/dist/index.d.ts"
-      ]
-    }
+    "types": ["node"]
   },
   "include": ["*.ts", "tests/*.ts"]
 }
