@@ -4,6 +4,7 @@ import { dirname, isAbsolute, join, normalize, relative } from "node:path";
 import { homedir } from "node:os";
 import type { OwnershipLevel, PolicyFile, PolicyIssue } from "./types.ts";
 import { canonicalPath, globToRegExp, isWithin, resolvePath } from "./path-utils.ts";
+import { isYoloControlPath } from "./live-yolo.ts";
 
 const DEFAULT_SECRET_PATTERNS = [
   "**/.env", "**/.env.*", "**/.npmrc", "**/.pypirc", "**/.netrc",
@@ -304,6 +305,7 @@ export class PolicyStore {
 
   isSecret(path: string): boolean {
     const canonical = canonicalPath(path);
+    if (isYoloControlPath(path) || isYoloControlPath(canonical)) return true;
     for (const entry of DEFAULT_SECRET_PATTERNS) {
       const pattern = entry.startsWith("~") ? resolvePath(entry, this.home, this.home) : entry;
       if (globToRegExp(pattern).test(canonical)) return true;

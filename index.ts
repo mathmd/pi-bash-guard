@@ -14,6 +14,8 @@ import { genericPathInputs } from "./tool-paths.ts";
 import { registerYoloMode } from "./yolo-mode.ts";
 import { captureBashContext, verifyBashContext, type BashContextSnapshot } from "./bash-context.ts";
 import { registerPermissionDiscussion } from "./permission-discussion.ts";
+import { registerSubagentYolo } from "./subagent-yolo.ts";
+import { isYoloControlPath } from "./live-yolo.ts";
 
 interface PendingCreation {
   paths: string[];
@@ -50,7 +52,7 @@ function analyzeTool(event: ToolCallEvent, cwd: string, analyzer: GuardAnalyzer,
   if (isToolCallEventType("read", event)) return analyzer.analyzePathAccess(event.input.path, "read", cwd, "read");
   if (isToolCallEventType("write", event)) {
     const path = canonicalPath(resolvePath(event.input.path, cwd, policy.home));
-    if (policy.isPolicyPath(path) || containsGitMetadata(path) || pathExists(path)) {
+    if (isYoloControlPath(path) || policy.isPolicyPath(path) || containsGitMetadata(path) || pathExists(path)) {
       return analyzer.analyzePathAccess(path, "edit", cwd, "write");
     }
     return { decision: "allow", reasons: [], accesses: [], creationCandidates: [path], trashablePaths: [], ownershipCandidates: [] };
@@ -78,7 +80,9 @@ export default function bashGuard(pi: ExtensionAPI): void {
   let policy: PolicyStore | undefined;
   let analyzer: GuardAnalyzer | undefined;
   const pending = new Map<string, PendingCreation>();
-  const yolo = registerYoloMode(pi);
+  const subagents = registerSubagentYolo(pi);
+  const yolo = registerYoloMode(pi, subagents);
+  subagents.bindMode(yolo.currentMode);
   const discussion = registerPermissionDiscussion(pi);
 
   function configure(cwd: string, trustLocal: boolean): string | undefined {
@@ -130,7 +134,7 @@ export default function bashGuard(pi: ExtensionAPI): void {
         (analysis.decision === "deny" ? `\nHard denial: ${analysis.reasons.join(" ")}` : "") };
     }
     // Decide only after analyzing the entire call, so a later/nested denial cannot be skipped.
-    const automatic = yolo.automaticDecision(analysis.decision);
+    const automatic = yolo.automaticDecision(analysis.decision, await yolo.currentMode());
     if (automatic === "deny") {
       pending.delete(event.toolCallId);
       return { block: true, reason: `Blocked by bash-guard (YOLO retains hard denials). ${analysis.reasons.join(" ")}` };
@@ -142,7 +146,12 @@ export default function bashGuard(pi: ExtensionAPI): void {
         reloadPolicy: analysis.creationCandidates.some((path) => policy!.isPolicyPath(path)),
       });
     }
-    if (analysis.decision === "allow" || automatic === "allow") { sealShellContext(); return; }
+    if (analysis.decision === "allow" || automatic === "allow") {
+      const failure = await subagents.prepare(event, ctx);
+      if (failure) { pending.delete(event.toolCallId); return { block: true, reason: failure }; }
+      sealShellContext();
+      return;
+    }
 
     let promptItems: Array<{ subject: string; analysis: Analysis; unitIndex?: number }>;
     if (isToolCallEventType("bash", event)) {
@@ -212,6 +221,8 @@ export default function bashGuard(pi: ExtensionAPI): void {
         };
       }
     }
+    const delegationFailure = await subagents.prepare(event, ctx);
+    if (delegationFailure) { pending.delete(event.toolCallId); return { block: true, reason: delegationFailure }; }
     sealShellContext();
     return;
   });

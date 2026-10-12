@@ -164,15 +164,48 @@ pi --bash-guard-yolo -p "Complete the task and run its tests"
 
 Every tool call is still fully analyzed. `ask` receives a one-time allowance without a permission menu, timeout, or attention notification. **All existing hard denials remain**: catastrophes, secret access, unowned permanent deletion, direct `.git` mutations, and system read-only mutations. A denial in any part of a compound call blocks the entire call immediately, even interactively; YOLO never automatically rewrites deletion into trash.
 
-YOLO writes no ownership grants, command/tool trust entries, policy settings, or saved mode state. Normal successful-creation ownership tracking still applies. The mode survives idle and compaction, but resets on `/reload`, `/new`, `/resume`, `/fork`/`/clone`, shutdown, and restart. The CLI flag applies only to the initial startup session, not subsequent resets. Child Pi/subagent processes do not inherit it; each needs its own explicit opt-in.
+YOLO writes no ownership grants, command/tool trust entries, policy settings, or saved mode state. Normal successful-creation ownership tracking still applies. The mode survives idle and compaction, but resets on `/reload`, `/new`, `/resume`, `/fork`/`/clone`, shutdown, and restart. The CLI flag applies only to the initial startup session, not subsequent resets. Independent headless Pi launches still need explicit opt-in. Supported native background subagents can instead follow their parent's live mode, as described below.
 
 Use external isolation (for example jail.nix) yourself. YOLO neither detects nor verifies a sandbox, cannot bypass other extensions' restrictions, and does not suppress unrelated Pi dialogs or agent questions. Auto-approving unresolved targets and arbitrary execution carries the same risks as manually choosing **Allow once**.
+
+### Live inheritance for native background subagents
+
+With official **pi-subagents 0.77.0**, bash-guard supplies launch metadata for new native background children requested through the `subagent` tool. No fork or replacement pi-subagents package is required. Both parent and child must load bash-guard, the parent must have a session file, and both processes must share the same local runtime directory. Use `async: true`; the upstream default is also background execution. Installing this version does not retrofit already-running children using older code.
+
+An inheriting child checks its live parent **at each tool permission decision**, without caching a positive mode. Starting with the parent off does not permanently disable inheritance: later on/off/on toggles affect the same running child. Nested background children follow their immediate parent's effective mode. A strict or opted-out child cannot pass inherited YOLO to descendants. Commands already approved or running are not cancelled, and stopped children are not restarted.
+
+To opt a new tool launch out, the parent agent can use:
+
+```json
+{"agent":"worker","task":"Review the change","async":true,"options":{"bashGuardInheritYolo":false}}
+```
+
+Bash-guard consumes that option before handing the call to pi-subagents. For an individual child inside a scripted workflow, use its existing binding option:
+
+```json
+{
+  "agent": "worker", "task": "Review the change", "async": true,
+  "extensionBindings": { "pi-bash-guard/1": { "inheritYolo": false } }
+}
+```
+
+The launch metadata identifies a parent; it does not authorize YOLO. The child checks its actual SDK session-header parent against that metadata, then queries the parent's private local socket. Other binding namespaces are preserved when the guard prepares a tool call. In pi-subagents 0.77.0, a scripted child's own `extensionBindings` replaces the whole workflow-default map; dropping the guard's route leaves that child strict. Do not manufacture parent metadata or copy it from another session.
+
+**Boundaries and failure behavior:**
+
+- Parent off, missing/malformed metadata, unreachable parent, invalid private runtime storage, or a query timeout means no inherited auto-approval. Phase one does **not** forward permission prompts: headless asks still refuse when YOLO is off.
+- Foreground in-process, extension-isolated, external/non-Pi, and alternate delegation APIs are not covered. Ambient runner metadata must not enable an unrelated foreground session. For external runners or mixed workflows, use `options.bashGuardInheritYolo:false` to avoid injecting unsupported binding defaults. A child that does not load bash-guard is not guarded by this extension.
+- Retained children keep their original inheritance route, not a saved mode. Their original parent's live state still governs while its authority is available. Route/opt-out changes on resume are rejected: start a fresh child to change the route. Parent shutdown/reload closes its authority; children fall back to strict mode. A new authority for the same session file can reconnect them; reloading a child itself resets its mode.
+- The channel uses private per-user storage under `$TMPDIR/pi-bash-guard-<uid>` (normally `/tmp/pi-bash-guard-<uid>`), directory mode `0700`, records/sockets `0600`, and random authentication tokens. Records contain no saved YOLO boolean. Direct tool access to this control state is a hard denial. Normal shutdown removes owned records and sockets; crashes can leave inert remnants, which do not authorize anything without a live server.
+- Requests are bounded to 4 KiB, eight parent hops, 32 simultaneous connections per authority, and a one-second timeout. Unix socket paths must fit within 100 bytes; a long `TMPDIR` needs shortening. This local same-user channel is not an OS sandbox or protection against hostile host processes/extensions.
 
 ## Tests
 
 Run `npm test`. Tests use isolated `/tmp/bash-guard-*` fixtures and never execute the hazardous command strings being analyzed. Extension-hook tests load copied extensions with the development Pi dependency's real loader with isolated `PI_CODING_AGENT_DIR` values, without using the live policy. Steering regressions also run Pi's real agent loop in sequential and parallel modes with scripted model responses and harmless tool spies; they verify delivery before another approval, skipped calls, fresh retry checks, and retry-loop prevention without network/model calls. Shell-context tests execute only harmless verification probes. New YOLO, shell-context, and steering fixtures are cleaned with `gio trash`.
 
 Policy-location regressions cover exact legacy preservation, destination precedence, symlinks, rejected invalid/older policies, filesystem failures, checkout-independent configuration, and fail-closed initialization under YOLO. Their scratch fixtures are also trashed.
+
+Live-inheritance regressions cover repeated toggles, concurrent parents, nested opt-outs, malformed/mismatched metadata, unavailable authorities, lifecycle resets, retained-route restrictions, and private-control-state denials. A separate-process integration uses official pi-subagents 0.77.0's native launch builder and child-session factory with Pi's real loader, scripted offline provider responses, and actual harmless fixture tool operations. It verifies off/on/off/on changes in an already-running child, opt-out, wrong-parent rejection, secret denials, and parent shutdown. It does not contact a remote provider or claim end-to-end coverage of every workflow dispatcher. A real headless CLI test also runs a scripted harmless write with and without `--bash-guard-yolo`. pi-subagents is a development-only test dependency; consumers keep their ordinary official installation. Fixture cleanup uses `gio trash`.
 
 ## Limits
 

@@ -16,6 +16,7 @@ import { juliaOperations } from "./julia-screening.ts";
 import { displayHeredocOperators, extractShellHeredocs, heredocHasDynamicExpansion, isHeredocMarker, type ShellHeredoc } from "./shell-heredoc.ts";
 import type { SourceScreening } from "./source-operations.ts";
 import type { PolicyStore } from "./policy.ts";
+import { isYoloControlPath } from "./live-yolo.ts";
 import { builtinCommandCategory, SHELL_CLOSING_WORDS, SHELL_HEADER_WORDS, SHELL_PREFIX_WORDS } from "./command-catalog.ts";
 import {
   assignmentEffects, copyShellEnvironment, initialShellEnvironment, invalidateShellEffects, knownShellValue,
@@ -2167,13 +2168,18 @@ export class GuardAnalyzer {
   ): Analysis {
     const safeCreations: string[] = [];
     for (const path of creations) {
-      if (this.policy.isPolicyPath(path) || this.policy.isSystemReadonlyPath(path) || containsGitMetadata(path)) {
+      if (isYoloControlPath(path) || this.policy.isPolicyPath(path) || this.policy.isSystemReadonlyPath(path) || containsGitMetadata(path)) {
         accesses.push({ path, kind: "edit", source: "creation", literal: true, existed: false });
       } else if (!path.startsWith(UNKNOWN_CWD)) safeCreations.push(path);
     }
     let decision: Decision = "allow";
     const ownershipCandidates: Analysis["ownershipCandidates"] = [];
     for (const access of accesses) {
+      if (isYoloControlPath(access.path)) {
+        decision = "deny";
+        reasons.push(`Private bash-guard control state cannot be accessed by tools: ${access.path}`);
+        continue;
+      }
       if (this.policy.isPolicyPath(access.path) && access.kind !== "read") {
         decision = strongest(decision, "ask");
         reasons.push(`Protected policy change requires approval: ${access.path}`);
